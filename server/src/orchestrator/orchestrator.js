@@ -6,7 +6,8 @@ import { route } from './router.js';
 import { newMemory, writeMemory, buildBoundedContext } from '../memory/store.js';
 import { runProcess } from '../connectors/processRunner.js';
 import { codexConnector } from '../connectors/codexConnector.js';
-import { resolveSafeWorkspacePath, initGitWorkspace, getGitStatus } from '../security/workspaceGuard.js';
+import { antigravityConnector } from '../connectors/antigravityConnector.js';
+import { resolveSafeWorkspacePath, initGitWorkspace, commitBaseline, getGitStatus } from '../security/workspaceGuard.js';
 
 const runs = new Map();
 const ALLOWED_MODES = new Set(['demo', 'codex']);
@@ -15,11 +16,14 @@ const ACCEPTANCE_COMMAND = 'node --test password.test.js';
 const demoSource = `export function validatePassword(password) {\n  return typeof password === 'string' && password.length >= 8 && /[A-Z]/.test(password) && /[a-z]/.test(password) && /[0-9]/.test(password);\n}\n`;
 const testSource = `import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { validatePassword } from './password.js';\ntest('valid password',()=>assert.equal(validatePassword('Password123'),true));\ntest('too short',()=>assert.equal(validatePassword('Pa1'),false));\ntest('no uppercase',()=>assert.equal(validatePassword('password123'),false));\ntest('no number',()=>assert.equal(validatePassword('PasswordOnly'),false));\n`;
 
-export function createRun(goal, mode = 'demo') {
+export function createRun(goal, mode = 'demo', acceptance) {
   if (typeof goal !== 'string' || !goal.trim() || goal.length > 1200) throw new Error('Objetivo inválido');
   if (!ALLOWED_MODES.has(mode)) throw new Error('Los conectores reales están bloqueados hasta validar docs/SPIKE.md');
   const id = randomUUID();
   const plan = createPlan(mode);
+  const acceptanceLabel = typeof acceptance === 'string' && acceptance.trim()
+    ? acceptance.trim().slice(0, 300)
+    : ACCEPTANCE_COMMAND;
   const run = {
     id,
     goal: goal.trim(),
@@ -29,9 +33,10 @@ export function createRun(goal, mode = 'demo') {
     events: [],
     startedAt: null,
     completedAt: null,
-    memory: newMemory(goal.trim(), { plan, acceptance: ACCEPTANCE_COMMAND }),
+    memory: newMemory(goal.trim(), { plan, acceptance: acceptanceLabel }),
     controller: new AbortController(),
   };
+  emit(run, 'plan.created', `Plan determinista creado (${plan.length} pasos)`, { mode, steps: plan.length });
   runs.set(id, run);
   return run;
 }
@@ -53,6 +58,10 @@ export function subscribe(run, listener) {
   return () => run.listeners.delete(listener);
 }
 
+export function markApproved(run) {
+  emit(run, 'run.approved', 'Plan aprobado por el operador');
+}
+
 export function cancelRun(run) {
   if (run.status === 'running') {
     run.controller.abort();
@@ -70,7 +79,11 @@ function buildPrompt(role, context) {
   ].join('\n');
 }
 
-export async function startRun(run, root, { codex = codexConnector, runner = runProcess } = {}) {
+export async function startRun(
+  run,
+  root,
+  { codex = codexConnector, antigravity = antigravityConnector, antigravityValidated = false, runner = runProcess } = {},
+) {
   if (run.status !== 'pending') throw new Error('Ejecución ya iniciada');
   run.status = 'running';
   run.startedAt = new Date().toISOString();
@@ -89,16 +102,18 @@ export async function startRun(run, root, { codex = codexConnector, runner = run
   };
 
   try {
-    dir = resolveSafeWorkspacePath(root, run.id);
-    const workspace = resolveSafeWorkspacePath(dir, 'workspace');
+    dir = await resolveSafeWorkspacePath(root, run.id);
+    const workspace = await resolveSafeWorkspacePath(root, run.id, 'workspace');
     await mkdir(workspace, { recursive: true });
+    const assertWorkspaceSafe = () => resolveSafeWorkspacePath(root, run.id, 'workspace');
+    await assertWorkspaceSafe();
     await writeMemory(dir, run.memory);
     await logEvent('plan', `Plan determinista (${run.plan.length} pasos)`, { mode: run.mode });
 
     if (run.mode === 'demo') {
       await runDemoFlow({ run, workspace, runner, logEvent, recordStep, assertNotCancelled });
     } else {
-      await runCodexFlow({ run, workspace, codex, runner, logEvent, recordStep, assertNotCancelled });
+      await runCodexFlow({ run, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, assertNotCancelled, assertWorkspaceSafe });
     }
   } catch (error) {
     const cancelled = run.controller.signal.aborted;
@@ -111,11 +126,14 @@ export async function startRun(run, root, { codex = codexConnector, runner = run
     }
   } finally {
     run.completedAt = new Date().toISOString();
+    const terminalType = run.status === 'completed'
+      ? 'run.completed'
+      : (run.status === 'cancelled' ? 'run.cancelled' : 'run.failed');
     try {
-      await logEvent('finish', `Estado final: ${run.status}`);
+      await logEvent(terminalType, `Estado final: ${run.status}`, { status: run.status });
       if (dir) await writeMemory(dir, run.memory);
     } catch {
-      emit(run, 'finish', `Estado final: ${run.status}`);
+      emit(run, terminalType, `Estado final: ${run.status}`, { status: run.status });
     }
   }
 }
@@ -145,38 +163,64 @@ async function runDemoFlow({ run, workspace, runner, logEvent, recordStep, asser
   run.status = result.code === 0 ? 'completed' : 'failed';
 }
 
-async function runCodexFlow({ run, workspace, codex, runner, logEvent, recordStep, assertNotCancelled }) {
-  await initGitWorkspace(workspace, { runner, signal: run.controller.signal });
+async function runCodexFlow({ run, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, assertNotCancelled, assertWorkspaceSafe }) {
   await writeFile(join(workspace, 'package.json'), '{"type":"module"}\n');
   await writeFile(join(workspace, 'password.test.js'), testSource);
+  await initGitWorkspace(workspace, { runner, signal: run.controller.signal });
+  await commitBaseline(workspace, { runner, signal: run.controller.signal });
 
   // Step 1: Implement (workspace-write)
   assertNotCancelled();
   const initialStatus = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   const implPrompt = buildPrompt('implement', buildBoundedContext(run.memory, initialStatus.files));
-  await logEvent('execute', 'Ejecutando implementación con Codex (workspace-write)');
+  await logEvent('step.started', 'Iniciando implementación (Codex workspace-write)', { step: 'implement', agent: 'codex-implement' });
   const impl = await codex.run(implPrompt, { workspace, sandbox: 'workspace-write', signal: run.controller.signal });
   if (impl.cancelled || run.controller.signal.aborted) throw new Error('Cancelado');
+  await assertWorkspaceSafe();
   const afterImpl = await getGitStatus(workspace, { runner, signal: run.controller.signal });
+  if (afterImpl.raw !== initialStatus.raw) {
+    await logEvent('files.changed', `Archivos modificados: ${afterImpl.files.join(', ')}`, { files: afterImpl.files });
+  }
   await recordStep('codex-implement', impl.ok ? 'ok' : 'failed', impl.output || impl.error || 'Sin salida', impl.ms, afterImpl.files);
+  await logEvent('step.completed', 'Implementación finalizada', { step: 'implement', agent: 'codex-implement', ok: impl.ok });
   if (!impl.ok) throw new Error(impl.error || `Implementación fallida (code ${impl.code})`);
 
-  // Step 2: Review (read-only) — must not modify files
+  // Step 2: Review (Antigravity plan+sandbox if validated & available; else Codex read-only fallback)
   assertNotCancelled();
   const beforeReview = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   const reviewPrompt = buildPrompt('review', buildBoundedContext(run.memory, beforeReview.files));
-  await logEvent('review', 'Ejecutando revisión con Codex (read-only)');
-  const review = await codex.run(reviewPrompt, { workspace, sandbox: 'read-only', signal: run.controller.signal });
+  const useAntigravity = Boolean(
+    antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available,
+  );
+  let reviewerAgent = 'codex-review';
+  let review;
+  if (useAntigravity) {
+    reviewerAgent = 'antigravity-review';
+    await logEvent('step.started', 'Iniciando revisión (Antigravity plan+sandbox)', { step: 'review', agent: reviewerAgent });
+    await logEvent('review', 'Ejecutando revisión con Antigravity (--mode plan --sandbox)');
+    const agyRes = await antigravity.run(reviewPrompt, { workspace, signal: run.controller.signal });
+    review = { ...agyRes, output: agyRes.untrustedResponse || agyRes.error || '' };
+  } else {
+    const reason = antigravityValidated ? 'Antigravity no disponible' : 'Antigravity no validado';
+    await logEvent('step.started', 'Iniciando revisión (Codex read-only)', { step: 'review', agent: reviewerAgent, fallback: true });
+    await logEvent('log', `Fallback de revisión a Codex read-only: ${reason}`, { fallback: true, reason });
+    await logEvent('review', 'Ejecutando revisión con Codex (read-only)');
+    review = await codex.run(reviewPrompt, { workspace, sandbox: 'read-only', signal: run.controller.signal });
+  }
   if (review.cancelled || run.controller.signal.aborted) throw new Error('Cancelado');
+  await assertWorkspaceSafe();
   const afterReview = await getGitStatus(workspace, { runner, signal: run.controller.signal });
-  await recordStep('codex-review', review.ok ? 'ok' : 'failed', review.output || review.error || 'Sin salida', review.ms, afterReview.files);
+  await recordStep(reviewerAgent, review.ok ? 'ok' : 'failed', review.output || review.error || 'Sin salida', review.ms, afterReview.files);
+  await logEvent('step.completed', 'Revisión finalizada', { step: 'review', agent: reviewerAgent, ok: review.ok });
   if (afterReview.raw !== beforeReview.raw) {
     throw new Error('Violación de solo lectura: el revisor modificó archivos del workspace');
   }
 
   // Step 3: Verify (fixed acceptance command)
   assertNotCancelled();
+  await logEvent('step.started', 'Iniciando verificación fija', { step: 'verify', agent: 'local-verifier' });
   const verify1 = await runAcceptanceVerify({ run, workspace, runner, logEvent, recordStep });
+  await logEvent('step.completed', 'Verificación finalizada', { step: 'verify', agent: 'local-verifier', ok: verify1.code === 0 });
   if (verify1.code === 0) {
     run.status = 'completed';
     return;
@@ -186,17 +230,24 @@ async function runCodexFlow({ run, workspace, codex, runner, logEvent, recordSte
   assertNotCancelled();
   const beforeFix = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   const fixPrompt = buildPrompt('fix', buildBoundedContext(run.memory, beforeFix.files));
-  await logEvent('execute', 'Ejecutando corrección única con Codex (workspace-write)');
+  await logEvent('step.started', 'Iniciando corrección única (Codex workspace-write)', { step: 'fix', agent: 'codex-fix' });
   const fix = await codex.run(fixPrompt, { workspace, sandbox: 'workspace-write', signal: run.controller.signal });
   if (fix.cancelled || run.controller.signal.aborted) throw new Error('Cancelado');
+  await assertWorkspaceSafe();
   const afterFix = await getGitStatus(workspace, { runner, signal: run.controller.signal });
+  if (afterFix.raw !== beforeFix.raw) {
+    await logEvent('files.changed', `Archivos modificados en corrección: ${afterFix.files.join(', ')}`, { files: afterFix.files });
+  }
   await recordStep('codex-fix', fix.ok ? 'ok' : 'failed', fix.output || fix.error || 'Sin salida', fix.ms, afterFix.files);
+  await logEvent('step.completed', 'Corrección finalizada', { step: 'fix', agent: 'codex-fix', ok: fix.ok });
   if (afterFix.raw === beforeFix.raw && !fix.output) {
     throw new Error('Corte por falta de progreso: la corrección no produjo cambios');
   }
 
   assertNotCancelled();
+  await logEvent('step.started', 'Iniciando verificación final', { step: 'verify', agent: 'local-verifier' });
   const verify2 = await runAcceptanceVerify({ run, workspace, runner, logEvent, recordStep });
+  await logEvent('step.completed', 'Verificación final terminada', { step: 'verify', agent: 'local-verifier', ok: verify2.code === 0 });
   if (verify2.code === 0) {
     run.status = 'completed';
     return;
@@ -216,6 +267,6 @@ async function runAcceptanceVerify({ run, workspace, runner, logEvent, recordSte
   if (result.cancelled || run.controller.signal.aborted) throw new Error('Cancelado');
   const status = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   await recordStep('local-verifier', result.code === 0 ? 'ok' : 'failed', `Exit ${result.code}; ${result.stdout.slice(-600)}`, result.ms, status.files);
-  await logEvent('verify', result.code === 0 ? 'Prueba de aceptación aprobada' : 'Prueba de aceptación fallida', { code: result.code });
+  await logEvent('verification.completed', result.code === 0 ? 'Prueba de aceptación aprobada' : 'Prueba de aceptación fallida', { code: result.code, passed: result.code === 0 });
   return result;
 }

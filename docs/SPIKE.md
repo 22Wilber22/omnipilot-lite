@@ -72,3 +72,42 @@ Prerrequisitos: `codex login` ejecutado fuera de OmniPilot y un repositorio Git 
    node -e "import('./server/src/connectors/codexConnector.js').then(async ({ codexConnector }) => { const res = await codexConnector.run('Responde únicamente OMNIPILOT_OK.', { workspace: process.cwd() + '/workspaces/manual-codex-test', sandbox: 'read-only', timeoutMs: 30000 }); console.log(JSON.stringify({ ok: res.ok, code: res.code, output: res.output, timedOut: res.timedOut, cancelled: res.cancelled, ms: res.ms }, null, 2)); })"
    ```
    Esperado: `ok: true`, `code: 0`, `output: "OMNIPILOT_OK"`.
+
+## Antigravity CLI (`agy`) — Evidencia real en macOS (revisor opcional)
+
+- **Estado:** Verificado en macOS (`agy 1.5.14`, `darwin_amd64`).
+- **Nota sobre Gemini CLI:** `Sign in with Google` en `@google/gemini-cli` fue descontinuado para cuentas individuales con migración oficial a Antigravity.
+- **Sintaxis verificada (solo revisión, sin `--cd`, usando `cwd` del proceso):**
+  ```bash
+  agy --prompt 'Responde únicamente OMNIPILOT_OK.' \
+    --output-format json \
+    --mode plan \
+    --sandbox \
+    --print-timeout 60s
+  ```
+- **Respuesta real observada:**
+  ```json
+  {
+    "conversation_id": "...",
+    "status": "SUCCESS",
+    "response": "OMNIPILOT_OK\n",
+    "duration_seconds": 6.68
+  }
+  ```
+- **Alcance:** Antigravity se registra como conector **revisor opcional** (`--mode plan --sandbox`); Codex permanece como agente de implementación. La salida `response` se trata siempre como datos no confiables.
+
+### Validación real mediante `antigravityConnector.js`
+
+Ejecutada una sola vez el 2026-11-22 desde un repositorio Git descartable dentro de `workspaces/`.
+
+- Disponibilidad: aprobada (`agy 1.5.14`).
+- Código de salida: `0`.
+- Estado parseado: `SUCCESS`.
+- Respuesta contiene `OMNIPILOT_OK`: sí.
+- JSON parseado correctamente: sí.
+- Duración del proceso: `9189 ms`.
+- Duración reportada por Antigravity: `6.566378 s`.
+- Archivos del workspace modificados: ninguno.
+- Timeout o cancelación: no.
+
+No se registran identificadores de conversación ni datos de autenticación.

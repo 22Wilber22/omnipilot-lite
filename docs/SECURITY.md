@@ -7,15 +7,16 @@ Codex se autentica fuera de OmniPilot mediante `codex login`. OmniPilot no solic
 ## Controles implementados
 
 - Ejecución con `spawn`, sin shell y con argumentos definidos por el conector.
-- Timeout, cancelación, salida limitada y stdin cerrado.
+- Timeout, cancelación del árbol completo, salida limitada y stdin cerrado.
+- Grupos de procesos separados en macOS y Linux, con una prueba que confirma la terminación de un hijo real. Windows usa `taskkill /t /f` mediante `spawn` y `shell: false`; esa rama no se ha validado en esta Mac.
 - Sandbox configurable y `read-only` por defecto.
 - Modo efímero y salida JSONL para la prueba real.
-- Workspaces reales definidos como repositorios Git dentro de `workspaces/`.
-- Modo real del orquestador deshabilitado hasta Sprint 2.
+- Workspaces reales definidos como repositorios Git dentro de `workspaces/`. El guard rechaza `..`, rutas absolutas o externas y symlinks en rutas existentes o dentro del workspace inspeccionado usando `lstat` y `realpath`.
+- Flujo Codex del orquestador implementado con pruebas falsas. La primera corrida end-to-end con Codex real sigue pendiente.
 
 ## Límites
 
-La ruta de trabajo, el repositorio Git y `--cd` reducen el alcance de la ejecución, pero no constituyen aislamiento fuerte. El aislamiento efectivo depende también del sandbox de Codex y de los permisos del proceso. No se añade `--skip-git-repo-check`.
+La ruta de trabajo, el repositorio Git y el sandbox de Codex reducen el alcance de la ejecución, pero no equivalen a aislamiento fuerte del sistema operativo. El proceso conserva los permisos disponibles para su sandbox y entorno. No se añade `--skip-git-repo-check`.
 
-Los registros pueden contener objetivos o respuestas sensibles y deben mantenerse locales. La terminación de árboles de procesos está implementada para POSIX y sigue pendiente de validación en Windows.
+Los registros pueden contener objetivos o respuestas sensibles y deben mantenerse locales. La terminación de árboles está verificada en POSIX; la estrategia implementada para Windows sigue pendiente de validación en Windows.
 

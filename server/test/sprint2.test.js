@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRun, startRun, cancelRun } from '../src/orchestrator/orchestrator.js';
@@ -45,7 +45,11 @@ describe('Sprint 2 — ejecución trazable con Codex (conectores falsos)', () =>
     expect(memory.goal).toBe('Implementar validatePassword');
     expect(memory.plan).toHaveLength(4);
     expect(memory.steps.map(s => s.agent)).toEqual(['codex-implement', 'codex-review', 'local-verifier']);
-    expect(memory.steps[0].files).toContain('password.js');
+    expect(memory.steps[0].files).toEqual(['password.js']);
+    const filesChangedEvent = run.events.find(e => e.type === 'files.changed');
+    expect(filesChangedEvent?.files).toEqual(['password.js']);
+    expect(filesChangedEvent?.files).not.toContain('package.json');
+    expect(filesChangedEvent?.files).not.toContain('password.test.js');
     const eventsRaw = await readFile(join(root, run.id, 'events.jsonl'), 'utf8');
     expect(eventsRaw).toContain('"type":"plan"');
     expect(eventsRaw).toContain('"type":"review"');
@@ -129,14 +133,41 @@ describe('Sprint 2 — ejecución trazable con Codex (conectores falsos)', () =>
 
   it('rechaza rutas que intentan salir del workspace', async () => {
     const root = await makeTempRoot();
-    expect(() => resolveSafeWorkspacePath(root, '../escape')).toThrow(/fuera del workspace/i);
-    expect(() => resolveSafeWorkspacePath(root, '/etc/passwd')).toThrow(/fuera del workspace/i);
+    await expect(resolveSafeWorkspacePath(root, '../escape')).rejects.toThrow(/fuera del workspace/i);
+    await expect(resolveSafeWorkspacePath(root, '/etc/passwd')).rejects.toThrow(/fuera del workspace/i);
 
     const run = createRun('Escape path', 'codex');
     run.id = '../escape';
     await startRun(run, root, { codex: { async run() { return { ok: true, code: 0, output: '', ms: 1 }; } } });
     expect(run.status).toBe('failed');
     expect(run.memory.problems.join(' ')).toMatch(/fuera del workspace/i);
+  });
+
+  it('rechaza symlinks dentro del workspace inspeccionado', async () => {
+    const root = await makeTempRoot();
+    const outside = await makeTempRoot();
+    const workspace = join(root, 'workspace');
+    await mkdir(workspace);
+    await symlink(outside, join(workspace, 'escape-link'));
+
+    await expect(resolveSafeWorkspacePath(root, 'workspace')).rejects.toThrow(/symlink/i);
+  });
+
+  it('detiene el flujo si Codex crea un symlink', async () => {
+    const root = await makeTempRoot();
+    const outside = await makeTempRoot();
+    const run = createRun('Crear implementación segura', 'codex');
+    const fakeCodex = {
+      async run(_prompt, ctx) {
+        await symlink(outside, join(ctx.workspace, 'escape-link'));
+        return { ok: true, code: 0, output: 'Implementado', ms: 3, cancelled: false };
+      },
+    };
+
+    await startRun(run, root, { codex: fakeCodex });
+
+    expect(run.status).toBe('failed');
+    expect(run.memory.problems.join(' ')).toMatch(/symlink/i);
   });
 
   it('registra cancelación correctamente', async () => {

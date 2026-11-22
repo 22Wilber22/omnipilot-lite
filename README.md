@@ -1,6 +1,6 @@
 # OmniPilot Lite — MVP local
 
-**Estado:** prototipo funcional en **modo demostración**. No ejecuta todavía Codex CLI ni Gemini CLI. La UI muestra explícitamente que los agentes son simulados. La verificación `node --test` sí ejecuta pruebas reales sobre un archivo generado de ejemplo.
+**Estado:** prototipo funcional con demo local y flujo Codex experimental. El conector Codex y el orquestador tienen pruebas con procesos falsos; este endurecimiento no ejecutó Codex real. La UI continúa identificando la demostración como simulada.
 
 ## Inicio
 
@@ -21,13 +21,14 @@ Abrir `http://127.0.0.1:5173`. Copiar el token de sesión que imprime el servido
 - Memoria de ejecución en JSON con validación Zod y escritura atómica.
 - Demostración claramente identificada de dos roles y transferencia de resumen.
 - Ejecución real de pruebas de aceptación con `spawn`, sin shell.
-- Timeout, salida acotada, cancelación y pruebas automatizadas del núcleo.
+- Timeout, salida acotada y cancelación del árbol de procesos. En macOS y Linux cada ejecución usa un grupo separado; Windows usa `taskkill /t /f` sin shell.
+- Validación de rutas contra `workspaces/` con rechazo de escapes y symlinks en rutas existentes y contenido inspeccionado.
 
 ## Lo que NO funciona todavía
 
-- Conectores reales Codex/Gemini: se habilitarán solo tras completar `docs/SPIKE.md` en el equipo del usuario.
+- Primera corrida end-to-end del orquestador con Codex real: pendiente de autorización y verificación.
 - Aislamiento fuerte: `cwd`, un repositorio Git temporal por ejecución y los flags `--sandbox` de Codex NO equivalen a un contenedor/VM ni garantizan aislamiento fuerte del sistema operativo. No ejecutar agentes no confiables sin controles adicionales.
-- Terminación fiable de árboles de procesos en Windows: pendiente de validación.
+- La estrategia de terminación con `taskkill` en Windows no se ha validado en esta Mac.
 - Autenticación y uso comercial de las CLI: pendiente de verificar términos y capacidades oficiales.
 - Persistencia/reanudación de ejecuciones tras reiniciar servidor.
 
@@ -37,4 +38,4 @@ No se ejecutan comandos arbitrarios del usuario o generados por IA. El verificad
 
 ## Siguiente fase
 
-Ejecutar `codex --version`, `gemini --version`, consultar sus ayudas y documentar los resultados en `docs/SPIKE.md`. No se inventarán flags. Después implementar adaptadores y verificar aislamiento/condiciones de uso antes de habilitar modo real.
+Ejecutar una primera corrida real controlada desde un repositorio Git bajo `workspaces/`, revisar sus artefactos y mantener el modo experimental hasta aprobar esa evidencia.

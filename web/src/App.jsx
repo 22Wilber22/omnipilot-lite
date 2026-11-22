@@ -1,17 +1,228 @@
-import { useEffect, useState } from 'react';
-const API = 'http://127.0.0.1:4317';
+import { useEffect, useRef, useState } from 'react';
+import { apiRequest, streamRunEvents } from './apiClient.js';
+import { IconLogo, IconSettings } from './components/Icons.jsx';
+import Sidebar from './components/Sidebar.jsx';
+import HistoryList from './components/HistoryList.jsx';
+import ActiveTeamPanel from './components/ActiveTeamPanel.jsx';
+import ChatWorkspace from './components/ChatWorkspace.jsx';
+import SettingsDrawer from './components/SettingsDrawer.jsx';
+
+const TERMINAL_EVENTS = new Set(['run.completed', 'run.failed', 'run.cancelled']);
+
+const INITIAL_SKILLS = [
+  { id: 'clean-code', name: 'Código limpio', description: 'Cambios pequeños, nombres claros y sin complejidad extra.', status: 'active' },
+  { id: 'focused-changes', name: 'Cambios enfocados', description: 'Limita las ediciones a los archivos necesarios de la tarea.', status: 'active' },
+  { id: 'controlled-fix', name: 'Corrección controlada', description: 'Un único intento de corrección guiado por el error real.', status: 'installed' },
+  { id: 'security-review', name: 'Revisión de seguridad', description: 'Verifica rutas, entradas y ausencia de comandos inseguros.', status: 'suggested' },
+  { id: 'reusable-components', name: 'Componentes reutilizables', description: 'Favorece piezas pequeñas con una sola responsabilidad.', status: 'suggested' },
+];
+
+const SAMPLE_HISTORY = [
+  { id: 'sample-1', title: 'Validación de contraseña', status: 'completed', timeAgo: 'hace 12m' },
+  { id: 'sample-2', title: 'Revisión de workspace Git', status: 'completed', timeAgo: 'hace 1h' },
+];
+
 export default function App() {
- const [token,setToken]=useState(''); const [goal,setGoal]=useState('Implementar validatePassword y verificarla con pruebas');
- const [run,setRun]=useState(null); const [events,setEvents]=useState([]); const [error,setError]=useState('');
- const request=async(path,method='GET',body)=>{ const r=await fetch(API+path,{method,headers:{'X-Omni-Token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json();if(!r.ok)throw Error(j.error||'Error');return j; };
- async function create(){try{setError('');setEvents([]);setRun(await request('/api/runs','POST',{goal,mode:'demo'}));}catch(e){setError(e.message)}}
- async function action(name){try{await request(`/api/runs/${run.id}/${name}`,'POST');refresh();}catch(e){setError(e.message)}}
- async function refresh(){if(!run)return;try{const r=await request(`/api/runs/${run.id}`);setRun(r);setEvents(r.events);}catch(e){setError(e.message)}}
- useEffect(()=>{if(!run||!['pending','running'].includes(run.status))return;const timer=setInterval(refresh,750);return()=>clearInterval(timer)},[run?.id,run?.status,token]);
- return <main><header><div><div className="eyebrow">DOJO · LOCAL-FIRST · JAVASCRIPT</div><h1>OmniPilot <span>Lite</span></h1><p>Un objetivo. Varios agentes. Una memoria compartida.</p></div><div className="mode">MODO DEMOSTRACIÓN<br/><small>Agentes simulados, pruebas reales</small></div></header>
- <div className="layout"><section><h2>1. Conexión local</h2><label>Token mostrado en la terminal del servidor</label><input type="password" value={token} onChange={e=>setToken(e.target.value)} placeholder="Pega el token local" autoComplete="off"/><p className="muted">El token solo permanece en esta pestaña. No se almacena en el navegador.</p></section>
- <section><h2>2. Objetivo</h2><textarea rows="3" maxLength="1200" value={goal} onChange={e=>setGoal(e.target.value)}/><button onClick={create} disabled={!token||!goal.trim()}>Crear plan</button></section></div>
- {run&&<section><div className="between"><h2>3. Plan y ejecución</h2><span className="pill">{run.status}</span></div><p className="muted">Ejecución {run.id.slice(0,8)} · {run.mode}</p><div className="steps">{run.plan.map(s=><article key={s.id}><b>{s.id}. {s.title}</b><small>{s.agent} · {s.role}</small></article>)}</div><div className="actions">{run.status==='pending'&&<button onClick={()=>action('approve')}>Aprobar y ejecutar</button>}{run.status==='running'&&<button className="danger" onClick={()=>action('cancel')}>Cancelar</button>}<button className="secondary" onClick={refresh}>Actualizar</button></div></section>}
- {run&&<section><h2>4. Registro de eventos</h2><div className="logs">{events.length?events.map(e=><div key={e.seq}><time>{e.at.slice(11,19)}</time> <b>[{e.type}]</b> {e.message}</div>):<span>Esperando aprobación...</span>}</div>{run.status==='completed'&&<p className="success">✓ Verificación finalizada. Revisa el archivo proyecto.json en workspaces/.</p>}</section>}
- {error&&<p className="error" role="alert">{error}</p>}<footer>Los conectores reales permanecen deshabilitados hasta verificar la autenticación, flags y sandbox de las CLI. Esta interfaz NO afirma ejecutar Codex ni Gemini.</footer></main>
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [token, setToken] = useState('');
+  const [mode, setMode] = useState('codex');
+  const [goal, setGoal] = useState('Implementar validatePassword para que pase la prueba de aceptación.');
+  const [acceptance, setAcceptance] = useState('node --test password.test.js');
+  const [roles, setRoles] = useState({
+    plan: 'antigravity',
+    implement: 'codex',
+    review: 'antigravity',
+    fix: 'codex',
+  });
+  const [skills, setSkills] = useState(INITIAL_SKILLS);
+  const [usageLevels, setUsageLevels] = useState({ codex: 'Medio', antigravity: 'Bajo' });
+  const [diagnostics, setDiagnostics] = useState(null);
+  const [run, setRun] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const streamAbortRef = useRef(null);
+
+  useEffect(() => () => streamAbortRef.current?.abort(), []);
+
+  async function checkConnection() {
+    try {
+      setBusy(true);
+      setError('');
+      setDiagnostics(await apiRequest(token, '/api/diagnostics'));
+    } catch (e) {
+      setDiagnostics(null);
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshRun(id) {
+    try {
+      const latest = await apiRequest(token, `/api/runs/${id}`);
+      setRun(latest);
+      if (Array.isArray(latest.events)) setEvents(latest.events);
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  function startSse(runId) {
+    streamAbortRef.current?.abort();
+    const ac = new AbortController();
+    streamAbortRef.current = ac;
+    streamRunEvents(token, runId, {
+      signal: ac.signal,
+      onEvent(ev) {
+        setEvents(prev => (prev.some(x => x.seq === ev.seq) ? prev : [...prev, ev]));
+        if (TERMINAL_EVENTS.has(ev.type)) {
+          ac.abort();
+          refreshRun(runId);
+        }
+      },
+      onError(err) {
+        setError(err.message);
+      },
+    });
+  }
+
+  async function createPlan() {
+    try {
+      setBusy(true);
+      setError('');
+      streamAbortRef.current?.abort();
+      const created = await apiRequest(token, '/api/runs', {
+        method: 'POST',
+        body: { goal, mode, acceptance },
+      });
+      setRun(created);
+      setEvents(created.events ?? []);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveRun() {
+    if (!run || run.status !== 'pending') return;
+    try {
+      setBusy(true);
+      setError('');
+      await apiRequest(token, `/api/runs/${run.id}/approve`, { method: 'POST' });
+      setRun(prev => (prev ? { ...prev, status: 'running' } : prev));
+      startSse(run.id);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelActiveRun() {
+    if (!run || run.status !== 'running') return;
+    try {
+      setBusy(true);
+      setError('');
+      await apiRequest(token, `/api/runs/${run.id}/cancel`, { method: 'POST' });
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function resetTask() {
+    streamAbortRef.current?.abort();
+    setRun(null);
+    setEvents([]);
+    setError('');
+  }
+
+  const lastStarted = [...events].reverse().find(e => e.type === 'step.started');
+  const activeAgent = run?.status === 'running' ? (lastStarted?.agent ?? '') : '';
+
+  const historyItems = run
+    ? [{ id: run.id, title: run.goal.slice(0, 34), status: run.status, timeAgo: 'ahora' }, ...SAMPLE_HISTORY]
+    : SAMPLE_HISTORY;
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand">
+          <IconLogo size={20} />
+          <strong>OmniPilot <span>Lite</span></strong>
+        </div>
+        <div className="topbar-right">
+          {diagnostics && <span className="status-pill">Conectado localmente</span>}
+          <button
+            type="button"
+            className="secondary sm"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Abrir ajustes"
+          >
+            <IconSettings /> Ajustes
+          </button>
+        </div>
+      </header>
+
+      <div className="shell-grid">
+        <Sidebar title="Historial" side="left">
+          <HistoryList
+            items={historyItems}
+            activeId={run?.id ?? 'sample-1'}
+            onNewTask={resetTask}
+          />
+        </Sidebar>
+
+        <ChatWorkspace
+          connected={Boolean(diagnostics)}
+          diagnostics={diagnostics}
+          mode={mode}
+          goal={goal}
+          setGoal={setGoal}
+          acceptance={acceptance}
+          setAcceptance={setAcceptance}
+          run={run}
+          events={events}
+          skills={skills}
+          onCreatePlan={createPlan}
+          onApprove={approveRun}
+          onCancel={cancelActiveRun}
+          onNewTask={resetTask}
+          onOpenSettings={() => setSettingsOpen(true)}
+          busy={busy}
+          error={error}
+        />
+
+        <Sidebar title="Equipo activo" side="right">
+          <ActiveTeamPanel
+            diagnostics={diagnostics}
+            usageLevels={usageLevels}
+            activeAgent={activeAgent}
+          />
+        </Sidebar>
+      </div>
+
+      <SettingsDrawer
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        token={token}
+        setToken={setToken}
+        mode={mode}
+        setMode={setMode}
+        diagnostics={diagnostics}
+        onCheckConnection={checkConnection}
+        roles={roles}
+        setRoles={setRoles}
+        skills={skills}
+        setSkills={setSkills}
+        usageLevels={usageLevels}
+        setUsageLevels={setUsageLevels}
+        busy={busy}
+        error={error}
+      />
+    </div>
+  );
 }
