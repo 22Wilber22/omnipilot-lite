@@ -12,7 +12,11 @@ npm test
 npm run dev
 ```
 
-Abrir `http://127.0.0.1:5173`. Copiar el token de sesión que imprime el servidor Node en la terminal; pegarlo en la UI. Crear plan, aprobar y revisar los eventos. Cada ejecución guarda `workspaces/<uuid>/proyecto.json`, `events.jsonl` y un subdirectorio `workspace` con la función y sus pruebas.
+Abrir `http://127.0.0.1:5173`. Copiar el token de sesión que imprime el servidor Node en la terminal; pegarlo en la UI. Crear plan, aprobar y revisar los eventos. Cada ejecución guarda `workspaces/<uuid>/proyecto.json`, `events.jsonl`, `changes.patch` y una copia en `workspaces/<uuid>/project`.
+
+## Proyectos locales
+
+`PROJECTS_ROOT` limita los proyectos seleccionables y usa `~/OmniPilotProjects` por defecto. `POST /api/projects/inspect` recibe un `projectPath` relativo y devuelve nombre, ruta relativa, scripts e indicador Git sin ejecutar scripts. Una fuente `local-project` copia el proyecto al workspace, excluye dependencias, metadatos Git y secretos comunes, y acepta únicamente una clave existente de `package.json.scripts` como verificación.
 
 ## Lo que ya funciona
 
@@ -23,6 +27,7 @@ Abrir `http://127.0.0.1:5173`. Copiar el token de sesión que imprime el servido
 - Ejecución real de pruebas de aceptación con `spawn`, sin shell.
 - Timeout, salida acotada y cancelación del árbol de procesos. En macOS y Linux cada ejecución usa un grupo separado; Windows usa `taskkill /t /f` sin shell.
 - Validación de rutas contra `workspaces/` con rechazo de escapes y symlinks en rutas existentes y contenido inspeccionado.
+- Inspección y copia de proyectos confinados a `PROJECTS_ROOT`; el repositorio original permanece sin cambios.
 
 ## Lo que NO funciona todavía
 

@@ -1,34 +1,53 @@
+import { useRef } from 'react';
 import { IconSend } from './Icons.jsx';
 
-const ACCEPTANCE_OPTIONS = [
-  { value: 'node --test password.test.js', label: 'Validación de contraseña' },
-];
+export default function ChatComposer({ value, onChange, onSend, disabled, sending }) {
+  const inputRef = useRef(null);
 
-export default function ChatComposer({ goal, setGoal, acceptance, setAcceptance, onSubmit, disabled, busy }) {
+  async function triggerSend() {
+    const trimmed = value.trim();
+    if (!trimmed || disabled || sending) return;
+    const accepted = await onSend(trimmed);
+    if (accepted) {
+      inputRef.current?.focus();
+    }
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      triggerSend();
+    }
+  }
+
   return (
     <form
       className="composer"
       onSubmit={e => {
         e.preventDefault();
-        if (!disabled && goal.trim() && !busy) onSubmit();
+        triggerSend();
       }}
     >
       <textarea
+        ref={inputRef}
         rows="2"
         maxLength="1200"
-        value={goal}
-        onChange={e => setGoal(e.target.value)}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        onKeyDown={handleKeyDown}
         placeholder="Describe qué quieres construir o pregunta por el estado de la tarea…"
-        disabled={busy}
+        aria-label="Mensaje para OmniPilot"
+        disabled={disabled || sending}
       />
       <div className="composer-foot">
-        <select value={acceptance} onChange={e => setAcceptance(e.target.value)} disabled={busy} aria-label="Prueba de aceptación">
-          {ACCEPTANCE_OPTIONS.map(opt => (
-            <option key={opt.value} value={opt.value}>{opt.label}</option>
-          ))}
-        </select>
-        <button type="submit" className="primary" disabled={disabled || !goal.trim() || busy} aria-label="Enviar tarea y crear plan">
-          <IconSend /> {busy ? 'Creando...' : 'Enviar'}
+        <span className="muted">Enter para enviar · Shift+Enter para nueva línea</span>
+        <button
+          type="submit"
+          className="primary"
+          disabled={disabled || sending || !value.trim()}
+          aria-label="Enviar mensaje"
+        >
+          <IconSend /> {sending ? 'Enviando...' : 'Enviar'}
         </button>
       </div>
     </form>

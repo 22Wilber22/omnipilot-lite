@@ -8,6 +8,7 @@ import ChatWorkspace from './components/ChatWorkspace.jsx';
 import SettingsDrawer from './components/SettingsDrawer.jsx';
 
 const TERMINAL_EVENTS = new Set(['run.completed', 'run.failed', 'run.cancelled']);
+const SAFE_PROJECT_PATH = /^[\p{L}\p{N}._/ -]*$/u;
 
 const INITIAL_SKILLS = [
   { id: 'clean-code', name: 'Código limpio', description: 'Cambios pequeños, nombres claros y sin complejidad extra.', status: 'active' },
@@ -17,39 +18,80 @@ const INITIAL_SKILLS = [
   { id: 'reusable-components', name: 'Componentes reutilizables', description: 'Favorece piezas pequeñas con una sola responsabilidad.', status: 'suggested' },
 ];
 
-const SAMPLE_HISTORY = [
-  { id: 'sample-1', title: 'Validación de contraseña', status: 'completed', timeAgo: 'hace 12m' },
-  { id: 'sample-2', title: 'Revisión de workspace Git', status: 'completed', timeAgo: 'hace 1h' },
-];
-
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [token, setToken] = useState('');
   const [mode, setMode] = useState('codex');
-  const [goal, setGoal] = useState('Implementar validatePassword para que pase la prueba de aceptación.');
-  const [acceptance, setAcceptance] = useState('node --test password.test.js');
-  const [roles, setRoles] = useState({
-    plan: 'antigravity',
-    implement: 'codex',
-    review: 'antigravity',
-    fix: 'codex',
-  });
+  const [composerText, setComposerText] = useState('');
+  const [roles, setRoles] = useState({ plan: 'antigravity', implement: 'codex', review: 'antigravity', fix: 'codex' });
   const [skills, setSkills] = useState(INITIAL_SKILLS);
   const [usageLevels, setUsageLevels] = useState({ codex: 'Medio', antigravity: 'Bajo' });
   const [diagnostics, setDiagnostics] = useState(null);
+  const [sourceType, setSourceType] = useState('template');
+  const [projectPath, setProjectPath] = useState('');
+  const [inspectedProject, setInspectedProject] = useState(null);
+  const [acceptanceScript, setAcceptanceScript] = useState('');
+  const [inspectingProject, setInspectingProject] = useState(false);
+  const [projectError, setProjectError] = useState('');
+
+  const [conversations, setConversations] = useState([]);
+  const [activeConvId, setActiveConvId] = useState(null);
+  const [messages, setMessages] = useState([]);
   const [run, setRun] = useState(null);
   const [events, setEvents] = useState([]);
+  const [sending, setSending] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [detachedRun, setDetachedRun] = useState(false);
   const streamAbortRef = useRef(null);
 
   useEffect(() => () => streamAbortRef.current?.abort(), []);
+  useEffect(() => {
+    if (sourceType === 'local-project' && mode !== 'codex') setMode('codex');
+  }, [sourceType, mode]);
+
+  const sourceReady = sourceType === 'template' || Boolean(inspectedProject && acceptanceScript);
+
+  async function refreshConversationList(currentToken = token) {
+    const data = await apiRequest(currentToken, '/api/conversations');
+    const list = data?.conversations ?? [];
+    setConversations(list);
+    return list;
+  }
+
+  async function openConversation(id, currentToken = token) {
+    streamAbortRef.current?.abort();
+    const conv = await apiRequest(currentToken, `/api/conversations/${id}`);
+    setActiveConvId(conv.id);
+    setDetachedRun(false);
+    setMessages(conv.messages ?? []);
+    const lastRunId = conv.runIds?.at(-1);
+    if (lastRunId) {
+      try {
+        const latestRun = await apiRequest(currentToken, `/api/runs/${lastRunId}`);
+        setRun(latestRun);
+        setEvents(latestRun.events ?? []);
+        if (latestRun.status === 'running') startSse(latestRun.id, conv.id, currentToken);
+      } catch {
+        setRun(null);
+        setEvents([]);
+      }
+    } else {
+      setRun(null);
+      setEvents([]);
+    }
+  }
 
   async function checkConnection() {
     try {
       setBusy(true);
       setError('');
-      setDiagnostics(await apiRequest(token, '/api/diagnostics'));
+      const diag = await apiRequest(token, '/api/diagnostics');
+      setDiagnostics(diag);
+      const list = await refreshConversationList(token);
+      if (list.length > 0) {
+        await openConversation(list[0].id, token);
+      }
     } catch (e) {
       setDiagnostics(null);
       setError(e.message);
@@ -58,27 +100,24 @@ export default function App() {
     }
   }
 
-  async function refreshRun(id) {
-    try {
-      const latest = await apiRequest(token, `/api/runs/${id}`);
-      setRun(latest);
-      if (Array.isArray(latest.events)) setEvents(latest.events);
-    } catch (e) {
-      setError(e.message);
-    }
-  }
-
-  function startSse(runId) {
+  function startSse(runId, convId, currentToken = token) {
     streamAbortRef.current?.abort();
     const ac = new AbortController();
     streamAbortRef.current = ac;
-    streamRunEvents(token, runId, {
+    streamRunEvents(currentToken, runId, {
       signal: ac.signal,
       onEvent(ev) {
         setEvents(prev => (prev.some(x => x.seq === ev.seq) ? prev : [...prev, ev]));
         if (TERMINAL_EVENTS.has(ev.type)) {
           ac.abort();
-          refreshRun(runId);
+          apiRequest(currentToken, `/api/runs/${runId}`).then(latest => {
+            setRun(latest);
+            if (Array.isArray(latest.events)) setEvents(latest.events);
+          }).catch(() => {});
+          if (convId) {
+            apiRequest(currentToken, `/api/conversations/${convId}`).then(c => setMessages(c.messages ?? [])).catch(() => {});
+            refreshConversationList(currentToken).catch(() => {});
+          }
         }
       },
       onError(err) {
@@ -87,21 +126,59 @@ export default function App() {
     });
   }
 
-  async function createPlan() {
+  async function handleNewTask() {
+    if (!diagnostics) return;
     try {
       setBusy(true);
       setError('');
       streamAbortRef.current?.abort();
-      const created = await apiRequest(token, '/api/runs', {
-        method: 'POST',
-        body: { goal, mode, acceptance },
-      });
-      setRun(created);
-      setEvents(created.events ?? []);
+      const conv = await apiRequest(token, '/api/conversations', { method: 'POST' });
+      setActiveConvId(conv.id);
+      setMessages([]);
+      setRun(null);
+      setEvents([]);
+      setDetachedRun(false);
+      await refreshConversationList();
     } catch (e) {
       setError(e.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleSendMessage(text) {
+    if (!sourceReady) return false;
+    try {
+      setSending(true);
+      setError('');
+      const source = sourceType === 'local-project'
+        ? { type: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript }
+        : { type: 'template' };
+      const createdRun = await apiRequest(token, '/api/runs', {
+        method: 'POST',
+        body: { goal: text, mode: sourceType === 'local-project' ? 'codex' : mode, source },
+      });
+      const createdAt = new Date().toISOString();
+      setComposerText('');
+      setMessages(previous => [
+        ...previous,
+        { id: `local-user-${createdRun.id}`, role: 'user', text, createdAt },
+        {
+          id: `local-plan-${createdRun.id}`,
+          role: 'orchestrator',
+          text: 'Preparé un plan para esta tarea. Revísalo y pulsa Aprobar y ejecutar.',
+          createdAt,
+        },
+      ]);
+      setRun(createdRun);
+      setEvents(createdRun.events ?? []);
+      setDetachedRun(true);
+      return true;
+    } catch (e) {
+      setError(e.message);
+      return false;
+    } finally {
+      setSending(false);
     }
   }
 
@@ -112,11 +189,59 @@ export default function App() {
       setError('');
       await apiRequest(token, `/api/runs/${run.id}/approve`, { method: 'POST' });
       setRun(prev => (prev ? { ...prev, status: 'running' } : prev));
-      startSse(run.id);
+      startSse(run.id, detachedRun ? null : activeConvId);
+      await refreshConversationList();
     } catch (e) {
       setError(e.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  function changeSourceType(nextType) {
+    setSourceType(nextType);
+    setProjectPath('');
+    setInspectedProject(null);
+    setAcceptanceScript('');
+    setProjectError('');
+  }
+
+  function changeProjectPath(nextPath) {
+    const parts = nextPath.split('/');
+    const unsafe = nextPath.startsWith('/')
+      || /^[A-Za-z]:[\\/]/.test(nextPath)
+      || parts.includes('..')
+      || !SAFE_PROJECT_PATH.test(nextPath);
+    if (unsafe) {
+      setProjectError('Usa solo una carpeta relativa, sin comandos, rutas absolutas ni “..”.');
+      return;
+    }
+    setProjectPath(nextPath);
+    setInspectedProject(null);
+    setAcceptanceScript('');
+    setProjectError('');
+  }
+
+  async function inspectProject() {
+    if (!projectPath.trim()) return;
+    try {
+      setInspectingProject(true);
+      setProjectError('');
+      const project = await apiRequest(token, '/api/projects/inspect', {
+        method: 'POST',
+        body: { projectPath: projectPath.trim() },
+      });
+      setInspectedProject(project);
+      setAcceptanceScript('');
+    } catch (inspectionError) {
+      setInspectedProject(null);
+      setAcceptanceScript('');
+      const message = inspectionError.message.includes('PROJECTS_ROOT no existe')
+        ? 'La carpeta ~/OmniPilotProjects no existe o no está disponible.'
+        : inspectionError.message;
+      setProjectError(message);
+    } finally {
+      setInspectingProject(false);
     }
   }
 
@@ -133,19 +258,8 @@ export default function App() {
     }
   }
 
-  function resetTask() {
-    streamAbortRef.current?.abort();
-    setRun(null);
-    setEvents([]);
-    setError('');
-  }
-
   const lastStarted = [...events].reverse().find(e => e.type === 'step.started');
   const activeAgent = run?.status === 'running' ? (lastStarted?.agent ?? '') : '';
-
-  const historyItems = run
-    ? [{ id: run.id, title: run.goal.slice(0, 34), status: run.status, timeAgo: 'ahora' }, ...SAMPLE_HISTORY]
-    : SAMPLE_HISTORY;
 
   return (
     <div className="app-shell">
@@ -168,11 +282,14 @@ export default function App() {
       </header>
 
       <div className="shell-grid">
-        <Sidebar title="Historial" side="left">
+        <Sidebar title="Chats" side="left">
           <HistoryList
-            items={historyItems}
-            activeId={run?.id ?? 'sample-1'}
-            onNewTask={resetTask}
+            items={conversations}
+            activeId={activeConvId}
+            connected={Boolean(diagnostics)}
+            onNewTask={handleNewTask}
+            onSelect={id => openConversation(id).catch(e => setError(e.message))}
+            busy={busy}
           />
         </Sidebar>
 
@@ -180,20 +297,33 @@ export default function App() {
           connected={Boolean(diagnostics)}
           diagnostics={diagnostics}
           mode={mode}
-          goal={goal}
-          setGoal={setGoal}
-          acceptance={acceptance}
-          setAcceptance={setAcceptance}
+          composerText={composerText}
+          setComposerText={setComposerText}
+          messages={messages}
           run={run}
           events={events}
           skills={skills}
-          onCreatePlan={createPlan}
+          onSendMessage={handleSendMessage}
           onApprove={approveRun}
           onCancel={cancelActiveRun}
-          onNewTask={resetTask}
+          onNewTask={handleNewTask}
           onOpenSettings={() => setSettingsOpen(true)}
+          sending={sending}
           busy={busy}
           error={error}
+          projectConfig={{
+            sourceType,
+            onSourceTypeChange: changeSourceType,
+            projectPath,
+            onProjectPathChange: changeProjectPath,
+            project: inspectedProject,
+            acceptanceScript,
+            onAcceptanceScriptChange: setAcceptanceScript,
+            onInspect: inspectProject,
+            inspecting: inspectingProject,
+            error: projectError,
+            ready: sourceReady,
+          }}
         />
 
         <Sidebar title="Equipo activo" side="right">

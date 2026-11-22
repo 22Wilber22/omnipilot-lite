@@ -19,21 +19,32 @@ const stepSchema = z.object({
   files: z.array(z.string()).default([]),
 });
 
+const sourceSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('template') }),
+  z.object({
+    type: z.literal('local-project'),
+    projectPath: z.string(),
+    acceptanceScript: z.string(),
+  }),
+]);
+
 export const memorySchema = z.object({
   goal: z.string(),
   plan: z.array(planStepSchema).default([]),
   acceptance: z.string().default(''),
+  source: sourceSchema.default({ type: 'template' }),
   decisions: z.array(z.string()).default([]),
   steps: z.array(stepSchema),
   problems: z.array(z.string()),
   updatedAt: z.string(),
 });
 
-export function newMemory(goal, { plan = [], acceptance = '' } = {}) {
+export function newMemory(goal, { plan = [], acceptance = '', source = { type: 'template' } } = {}) {
   return {
     goal,
     plan,
     acceptance,
+    source,
     decisions: [],
     steps: [],
     problems: [],
@@ -50,6 +61,8 @@ export function buildBoundedContext(memory, modifiedFiles = []) {
   }));
   return {
     goal: memory.goal,
+    acceptance: memory.acceptance,
+    source: memory.source,
     recentSummaries,
     modifiedFiles: [...modifiedFiles],
   };

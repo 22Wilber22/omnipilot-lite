@@ -73,6 +73,22 @@ export async function commitBaseline(workspaceDir, { runner = runProcess, signal
   if (commit.code !== 0 || commit.error) throw new Error(`Error en commit base: ${commit.error || commit.stderr.trim()}`);
 }
 
+export async function captureGitPatch(workspaceDir, { runner = runProcess, signal } = {}) {
+  const add = await runner({ command: 'git', args: ['add', '-A'], cwd: workspaceDir, timeoutMs: 10000, signal });
+  if (add.cancelled) throw new Error('Cancelado');
+  if (add.code !== 0 || add.error) throw new Error(`Error al preparar parche: ${add.error || add.stderr.trim()}`);
+  const diff = await runner({
+    command: 'git',
+    args: ['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--'],
+    cwd: workspaceDir,
+    timeoutMs: 10000,
+    signal,
+  });
+  if (diff.cancelled) throw new Error('Cancelado');
+  if (diff.code !== 0 || diff.error) throw new Error(`Error al calcular parche: ${diff.error || diff.stderr.trim()}`);
+  return diff.stdout;
+}
+
 export async function getGitStatus(workspaceDir, { runner = runProcess, signal } = {}) {
   const res = await runner({
     command: 'git',

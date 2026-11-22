@@ -12,6 +12,9 @@ Codex se autentica fuera de OmniPilot mediante `codex login`. OmniPilot no solic
 - Sandbox configurable y `read-only` por defecto.
 - Modo efímero y salida JSONL para la prueba real.
 - Workspaces reales definidos como repositorios Git dentro de `workspaces/`. El guard rechaza `..`, rutas absolutas o externas y symlinks en rutas existentes o dentro del workspace inspeccionado usando `lstat` y `realpath`.
+- Proyectos fuente limitados a rutas relativas bajo `PROJECTS_ROOT`, resueltas con `realpath` y rechazadas si contienen escapes o symlinks incluidos. La copia omite `node_modules`, `.git`, `.env`, configuraciones de credenciales y extensiones comunes de claves.
+- Scripts de aceptación seleccionados exclusivamente por nombre entre las claves de `package.json.scripts`; la ejecución usa `npm run <nombre-validado>` con `shell: false`.
+- Parche de evidencia calculado con Git desde el commit baseline de la copia temporal. El proyecto fuente nunca se usa como directorio de ejecución.
 - Flujo Codex del orquestador implementado con pruebas falsas. La primera corrida end-to-end con Codex real sigue pendiente.
 
 ## Límites

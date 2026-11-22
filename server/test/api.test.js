@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../src/api/app.js';
@@ -43,6 +43,47 @@ async function waitForTerminal(baseUrl, token, id) {
 }
 
 describe('Sprint 3A — API local y SSE (conectores falsos)', () => {
+  it('inspecciona un proyecto permitido y valida source local-project al crear el run', async () => {
+    const projectsRoot = await mkdtemp(join(tmpdir(), 'omnipilot-projects-api-'));
+    tempDirs.push(projectsRoot);
+    const project = join(projectsRoot, 'allowed-project');
+    await mkdir(join(project, '.git'), { recursive: true });
+    await writeFile(join(project, 'package.json'), JSON.stringify({
+      name: 'allowed-project',
+      scripts: { test: 'node --test' },
+    }));
+    const { baseUrl, token } = await startTestServer({ projectsRoot });
+
+    const inspected = await fetch(`${baseUrl}/api/projects/inspect`, {
+      method: 'POST',
+      headers: { 'X-Omni-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectPath: 'allowed-project' }),
+    });
+    expect(inspected.status).toBe(200);
+    expect(await inspected.json()).toEqual({
+      name: 'allowed-project',
+      projectPath: 'allowed-project',
+      scripts: ['test'],
+      isGitRepository: true,
+    });
+
+    const created = await fetch(`${baseUrl}/api/runs`, {
+      method: 'POST',
+      headers: { 'X-Omni-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        goal: 'Ejecutar proyecto permitido',
+        mode: 'codex',
+        source: { type: 'local-project', projectPath: 'allowed-project', acceptanceScript: 'test' },
+      }),
+    });
+    expect(created.status).toBe(201);
+    expect((await created.json()).source).toEqual({
+      type: 'local-project',
+      projectPath: 'allowed-project',
+      acceptanceScript: 'test',
+    });
+  });
+
   it('protege /api con token y rechaza Origin externo', async () => {
     const { baseUrl, token } = await startTestServer({
       codex: { async isAvailable() { return { available: true, version: 'codex-fake', error: null }; } },

@@ -7,7 +7,8 @@ import { newMemory, writeMemory, buildBoundedContext } from '../memory/store.js'
 import { runProcess } from '../connectors/processRunner.js';
 import { codexConnector } from '../connectors/codexConnector.js';
 import { antigravityConnector } from '../connectors/antigravityConnector.js';
-import { resolveSafeWorkspacePath, initGitWorkspace, commitBaseline, getGitStatus } from '../security/workspaceGuard.js';
+import { resolveSafeWorkspacePath, initGitWorkspace, commitBaseline, captureGitPatch, getGitStatus } from '../security/workspaceGuard.js';
+import { copyLocalProject, isExcludedProjectPath } from '../projects/localProjects.js';
 
 const runs = new Map();
 const ALLOWED_MODES = new Set(['demo', 'codex']);
@@ -16,24 +17,39 @@ const ACCEPTANCE_COMMAND = 'node --test password.test.js';
 const demoSource = `export function validatePassword(password) {\n  return typeof password === 'string' && password.length >= 8 && /[A-Z]/.test(password) && /[a-z]/.test(password) && /[0-9]/.test(password);\n}\n`;
 const testSource = `import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { validatePassword } from './password.js';\ntest('valid password',()=>assert.equal(validatePassword('Password123'),true));\ntest('too short',()=>assert.equal(validatePassword('Pa1'),false));\ntest('no uppercase',()=>assert.equal(validatePassword('password123'),false));\ntest('no number',()=>assert.equal(validatePassword('PasswordOnly'),false));\n`;
 
-export function createRun(goal, mode = 'demo', acceptance) {
+function normalizeRunSource(source) {
+  if (!source || source.type === 'template') return { type: 'template' };
+  if (source.type !== 'local-project') throw new Error('Tipo de source inválido');
+  if (typeof source.projectPath !== 'string' || !source.projectPath.trim()) throw new Error('projectPath requerido');
+  if (typeof source.acceptanceScript !== 'string' || !source.acceptanceScript.trim()) throw new Error('acceptanceScript requerido');
+  return {
+    type: 'local-project',
+    projectPath: source.projectPath.trim(),
+    acceptanceScript: source.acceptanceScript.trim(),
+  };
+}
+
+export function createRun(goal, mode = 'demo', source = { type: 'template' }) {
   if (typeof goal !== 'string' || !goal.trim() || goal.length > 1200) throw new Error('Objetivo inválido');
   if (!ALLOWED_MODES.has(mode)) throw new Error('Los conectores reales están bloqueados hasta validar docs/SPIKE.md');
+  const normalizedSource = normalizeRunSource(source);
+  if (normalizedSource.type === 'local-project' && mode !== 'codex') throw new Error('local-project requiere mode codex');
   const id = randomUUID();
   const plan = createPlan(mode);
-  const acceptanceLabel = typeof acceptance === 'string' && acceptance.trim()
-    ? acceptance.trim().slice(0, 300)
+  const acceptanceLabel = normalizedSource.type === 'local-project'
+    ? `npm run ${normalizedSource.acceptanceScript}`
     : ACCEPTANCE_COMMAND;
   const run = {
     id,
     goal: goal.trim(),
     mode,
     status: 'pending',
+    source: normalizedSource,
     plan,
     events: [],
     startedAt: null,
     completedAt: null,
-    memory: newMemory(goal.trim(), { plan, acceptance: acceptanceLabel }),
+    memory: newMemory(goal.trim(), { plan, acceptance: acceptanceLabel, source: normalizedSource }),
     controller: new AbortController(),
   };
   emit(run, 'plan.created', `Plan determinista creado (${plan.length} pasos)`, { mode, steps: plan.length });
@@ -82,7 +98,13 @@ function buildPrompt(role, context) {
 export async function startRun(
   run,
   root,
-  { codex = codexConnector, antigravity = antigravityConnector, antigravityValidated = false, runner = runProcess } = {},
+  {
+    codex = codexConnector,
+    antigravity = antigravityConnector,
+    antigravityValidated = false,
+    runner = runProcess,
+    projectsRoot,
+  } = {},
 ) {
   if (run.status !== 'pending') throw new Error('Ejecución ya iniciada');
   run.status = 'running';
@@ -103,17 +125,27 @@ export async function startRun(
 
   try {
     dir = await resolveSafeWorkspacePath(root, run.id);
-    const workspace = await resolveSafeWorkspacePath(root, run.id, 'workspace');
-    await mkdir(workspace, { recursive: true });
-    const assertWorkspaceSafe = () => resolveSafeWorkspacePath(root, run.id, 'workspace');
+    const workspace = await resolveSafeWorkspacePath(root, run.id, 'project');
+    if (run.source.type === 'local-project') {
+      await mkdir(dir, { recursive: true });
+      await copyLocalProject({ projectsRoot, ...run.source, destination: workspace });
+    } else {
+      await mkdir(workspace, { recursive: true });
+    }
+    const assertWorkspaceSafe = () => resolveSafeWorkspacePath(root, run.id, 'project');
     await assertWorkspaceSafe();
     await writeMemory(dir, run.memory);
-    await logEvent('plan', `Plan determinista (${run.plan.length} pasos)`, { mode: run.mode });
+    await logEvent('plan', `Plan determinista (${run.plan.length} pasos)`, {
+      mode: run.mode,
+      source: run.source.type,
+      projectPath: run.source.projectPath ?? null,
+      acceptanceScript: run.source.acceptanceScript ?? null,
+    });
 
     if (run.mode === 'demo') {
       await runDemoFlow({ run, workspace, runner, logEvent, recordStep, assertNotCancelled });
     } else {
-      await runCodexFlow({ run, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, assertNotCancelled, assertWorkspaceSafe });
+      await runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, assertNotCancelled, assertWorkspaceSafe });
     }
   } catch (error) {
     const cancelled = run.controller.signal.aborted;
@@ -163,9 +195,11 @@ async function runDemoFlow({ run, workspace, runner, logEvent, recordStep, asser
   run.status = result.code === 0 ? 'completed' : 'failed';
 }
 
-async function runCodexFlow({ run, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, assertNotCancelled, assertWorkspaceSafe }) {
-  await writeFile(join(workspace, 'package.json'), '{"type":"module"}\n');
-  await writeFile(join(workspace, 'password.test.js'), testSource);
+async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, assertNotCancelled, assertWorkspaceSafe }) {
+  if (run.source.type === 'template') {
+    await writeFile(join(workspace, 'package.json'), '{"type":"module"}\n');
+    await writeFile(join(workspace, 'password.test.js'), testSource);
+  }
   await initGitWorkspace(workspace, { runner, signal: run.controller.signal });
   await commitBaseline(workspace, { runner, signal: run.controller.signal });
 
@@ -178,6 +212,8 @@ async function runCodexFlow({ run, workspace, codex, antigravity, antigravityVal
   if (impl.cancelled || run.controller.signal.aborted) throw new Error('Cancelado');
   await assertWorkspaceSafe();
   const afterImpl = await getGitStatus(workspace, { runner, signal: run.controller.signal });
+  if (afterImpl.files.some(isExcludedProjectPath)) throw new Error('Codex creó un archivo excluido o sensible');
+  await writeFile(join(dir, 'changes.patch'), await captureGitPatch(workspace, { runner, signal: run.controller.signal }), { mode: 0o600 });
   if (afterImpl.raw !== initialStatus.raw) {
     await logEvent('files.changed', `Archivos modificados: ${afterImpl.files.join(', ')}`, { files: afterImpl.files });
   }
@@ -235,6 +271,8 @@ async function runCodexFlow({ run, workspace, codex, antigravity, antigravityVal
   if (fix.cancelled || run.controller.signal.aborted) throw new Error('Cancelado');
   await assertWorkspaceSafe();
   const afterFix = await getGitStatus(workspace, { runner, signal: run.controller.signal });
+  if (afterFix.files.some(isExcludedProjectPath)) throw new Error('Codex creó un archivo excluido o sensible');
+  await writeFile(join(dir, 'changes.patch'), await captureGitPatch(workspace, { runner, signal: run.controller.signal }), { mode: 0o600 });
   if (afterFix.raw !== beforeFix.raw) {
     await logEvent('files.changed', `Archivos modificados en corrección: ${afterFix.files.join(', ')}`, { files: afterFix.files });
   }
@@ -256,10 +294,16 @@ async function runCodexFlow({ run, workspace, codex, antigravity, antigravityVal
 }
 
 async function runAcceptanceVerify({ run, workspace, runner, logEvent, recordStep }) {
-  await logEvent('verify', `Ejecutando verificación fija: ${ACCEPTANCE_COMMAND}`);
+  const acceptance = run.source.type === 'local-project'
+    ? { command: process.platform === 'win32' ? 'npm.cmd' : 'npm', args: ['run', run.source.acceptanceScript], label: `npm run ${run.source.acceptanceScript}` }
+    : { command: process.execPath, args: ['--test', 'password.test.js'], label: ACCEPTANCE_COMMAND };
+  await logEvent('verify', `Ejecutando verificación fija: ${acceptance.label}`, {
+    projectPath: run.source.projectPath ?? null,
+    acceptanceScript: run.source.acceptanceScript ?? null,
+  });
   const result = await runner({
-    command: process.execPath,
-    args: ['--test', 'password.test.js'],
+    command: acceptance.command,
+    args: acceptance.args,
     cwd: workspace,
     timeoutMs: 10000,
     signal: run.controller.signal,
