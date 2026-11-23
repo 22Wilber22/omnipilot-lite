@@ -91,6 +91,31 @@ describe('Sprint 4 — Conversaciones locales y clasificación determinista', ()
     expect(rawFile).not.toContain(token);
   });
 
+  it('POST de "dale" responde como conversación sin crear run ni llamar agentes', async () => {
+    let codexCalled = false;
+    const { baseUrl, token } = await startServer({
+      codex: {
+        async isAvailable() { return { available: true }; },
+        async run() { codexCalled = true; return { ok: true, code: 0, output: '', ms: 1 }; },
+      },
+    });
+    const conv = await (await fetch(`${baseUrl}/api/conversations`, {
+      method: 'POST', headers: { 'X-Omni-Token': token },
+    })).json();
+
+    const response = await fetch(`${baseUrl}/api/conversations/${conv.id}/messages`, {
+      method: 'POST',
+      headers: { 'X-Omni-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'dale', mode: 'codex' }),
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(201);
+    expect(body.run).toBeNull();
+    expect(body.reply.text).toMatch(/Entendido/i);
+    expect(codexCalled).toBe(false);
+  });
+
   it('solicitud de código crea plan pendiente sin ejecutar; solo aprobación inicia el run', async () => {
     let codexCalled = false;
     const { baseUrl, token } = await startServer({
@@ -107,7 +132,8 @@ describe('Sprint 4 — Conversaciones locales y clasificación determinista', ()
 
     const conv = await (await fetch(`${baseUrl}/api/conversations`, {
       method: 'POST',
-      headers: { 'X-Omni-Token': token },
+      headers: { 'X-Omni-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectConfig: { sourceType: 'template' } }),
     })).json();
 
     const msgRes = await fetch(`${baseUrl}/api/conversations/${conv.id}/messages`, {

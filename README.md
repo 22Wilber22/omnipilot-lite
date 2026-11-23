@@ -14,6 +14,10 @@ npm run dev
 
 Abrir `http://127.0.0.1:5173`. Copiar el token de sesión que imprime el servidor Node en la terminal; pegarlo en la UI. Crear plan, aprobar y revisar los eventos. Cada ejecución guarda `workspaces/<uuid>/proyecto.json`, `events.jsonl`, `changes.patch` y una copia en `workspaces/<uuid>/project`.
 
+## Prueba local de OmniPilot
+
+Inicia OmniPilot con `npm run dev`, conecta el token local y envía una tarea concreta. Confirma el plan antes de pulsar **Aprobar y ejecutar**; al terminar, revisa eventos, archivos cambiados y prueba de aceptación en la ficha de evidencia.
+
 ## Proyectos locales
 
 `PROJECTS_ROOT` limita los proyectos seleccionables y usa `~/OmniPilotProjects` por defecto. `POST /api/projects/inspect` recibe un `projectPath` relativo y devuelve nombre, ruta relativa, scripts e indicador Git sin ejecutar scripts. Una fuente `local-project` copia el proyecto al workspace, excluye dependencias, metadatos Git y secretos comunes, y acepta únicamente una clave existente de `package.json.scripts` como verificación.

@@ -1,5 +1,5 @@
 import { lstat, realpath, readdir } from 'node:fs/promises';
-import { resolve, relative, isAbsolute, join } from 'node:path';
+import { resolve, relative, isAbsolute, join, sep } from 'node:path';
 import { runProcess } from '../connectors/processRunner.js';
 
 function isOutside(root, target) {
@@ -7,11 +7,39 @@ function isOutside(root, target) {
   return !rel || rel.startsWith('..') || isAbsolute(rel);
 }
 
-async function rejectSymlinks(path) {
-  const stats = await lstat(path);
-  if (stats.isSymbolicLink()) throw new Error('Symlink no permitido en workspace');
+async function isAllowedNpmBinSymlink(linkPath, workspaceRoot) {
+  const rel = relative(workspaceRoot, linkPath);
+  const parts = rel.split(/[\\/]+/);
+  if (parts.length !== 3 || parts[0] !== 'node_modules' || parts[1] !== '.bin') return false;
+
+  const nodeModulesPath = join(workspaceRoot, 'node_modules');
+  const nmStats = await lstat(nodeModulesPath);
+  if (nmStats.isSymbolicLink() || !nmStats.isDirectory()) return false;
+
+  let realNodeModules;
+  let realTarget;
+  try {
+    realNodeModules = await realpath(nodeModulesPath);
+    realTarget = await realpath(linkPath);
+  } catch {
+    return false;
+  }
+  return realTarget.startsWith(realNodeModules + sep);
+}
+
+async function rejectSymlinks(currentPath, workspaceRoot, state) {
+  const stats = await lstat(currentPath);
+  if (stats.isSymbolicLink()) {
+    if (await isAllowedNpmBinSymlink(currentPath, workspaceRoot)) {
+      state.allowedNpmBinSymlinks += 1;
+      return;
+    }
+    throw new Error('Symlink no permitido en workspace');
+  }
   if (!stats.isDirectory()) return;
-  for (const entry of await readdir(path)) await rejectSymlinks(join(path, entry));
+  for (const entry of await readdir(currentPath)) {
+    await rejectSymlinks(join(currentPath, entry), workspaceRoot, state);
+  }
 }
 
 export async function resolveSafeWorkspacePath(root, ...segments) {
@@ -38,8 +66,9 @@ export async function resolveSafeWorkspacePath(root, ...segments) {
       throw error;
     }
   }
+  const state = { allowedNpmBinSymlinks: 0 };
   try {
-    await rejectSymlinks(target);
+    await rejectSymlinks(target, target, state);
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
@@ -53,7 +82,13 @@ export async function initGitWorkspace(workspaceDir, { runner = runProcess, sign
 }
 
 export async function commitBaseline(workspaceDir, { runner = runProcess, signal } = {}) {
-  const add = await runner({ command: 'git', args: ['add', '-A'], cwd: workspaceDir, timeoutMs: 10000, signal });
+  const add = await runner({
+    command: 'git',
+    args: ['add', '-A', '--', '.', ':(exclude)node_modules'],
+    cwd: workspaceDir,
+    timeoutMs: 10000,
+    signal,
+  });
   if (add.cancelled) throw new Error('Cancelado');
   if (add.code !== 0 || add.error) throw new Error(`Error en git add: ${add.error || add.stderr.trim()}`);
 
@@ -74,12 +109,18 @@ export async function commitBaseline(workspaceDir, { runner = runProcess, signal
 }
 
 export async function captureGitPatch(workspaceDir, { runner = runProcess, signal } = {}) {
-  const add = await runner({ command: 'git', args: ['add', '-A'], cwd: workspaceDir, timeoutMs: 10000, signal });
+  const add = await runner({
+    command: 'git',
+    args: ['add', '-A', '--', '.', ':(exclude)node_modules'],
+    cwd: workspaceDir,
+    timeoutMs: 10000,
+    signal,
+  });
   if (add.cancelled) throw new Error('Cancelado');
   if (add.code !== 0 || add.error) throw new Error(`Error al preparar parche: ${add.error || add.stderr.trim()}`);
   const diff = await runner({
     command: 'git',
-    args: ['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--'],
+    args: ['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--', '.', ':(exclude)node_modules'],
     cwd: workspaceDir,
     timeoutMs: 10000,
     signal,
@@ -92,7 +133,7 @@ export async function captureGitPatch(workspaceDir, { runner = runProcess, signa
 export async function getGitStatus(workspaceDir, { runner = runProcess, signal } = {}) {
   const res = await runner({
     command: 'git',
-    args: ['status', '--porcelain', '--untracked-files=all'],
+    args: ['status', '--porcelain', '--untracked-files=all', '--', '.', ':(exclude)node_modules'],
     cwd: workspaceDir,
     timeoutMs: 10000,
     signal,
@@ -100,6 +141,8 @@ export async function getGitStatus(workspaceDir, { runner = runProcess, signal }
   if (res.cancelled) throw new Error('Cancelado');
   if (res.code !== 0 || res.error) throw new Error(`Error al consultar git status: ${res.error || res.stderr.trim()}`);
   const lines = res.stdout.split(/\r?\n/).filter(Boolean).sort();
-  const files = lines.map(line => line.slice(3).trim()).filter(Boolean);
+  const files = lines
+    .map(line => line.slice(3).trim())
+    .filter(f => Boolean(f) && f !== 'node_modules' && !f.startsWith('node_modules/'));
   return { raw: lines.join('\n'), files };
 }

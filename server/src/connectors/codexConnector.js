@@ -1,4 +1,5 @@
 import { runProcess } from './processRunner.js';
+import { extractUsageFromEvents } from '../metrics/usageTracker.js';
 
 const ALLOWED_SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
 const DEFAULT_SANDBOX = 'read-only';
@@ -68,12 +69,14 @@ export function createCodexConnector({ command = 'codex', runner = runProcess } 
       const args = buildCodexArgs({ workspace, sandbox, prompt });
       const result = await runner({ command, args, cwd: workspace.trim(), timeoutMs, signal, maxOutput });
       const events = parseJsonLines(result.stdout);
+      const usage = extractUsageFromEvents(events);
       const ok = result.code === 0 && !result.error && !result.timedOut && !result.cancelled;
       return {
         ok,
         code: result.code,
         output: extractOutput(events, result.stdout),
         events,
+        usage,
         stdout: result.stdout,
         stderr: result.stderr,
         ms: result.ms,

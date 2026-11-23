@@ -184,5 +184,45 @@ describe('Sprint 2 — ejecución trazable con Codex (conectores falsos)', () =>
     expect(run.status).toBe('cancelled');
     const eventsRaw = await readFile(join(root, run.id, 'events.jsonl'), 'utf8');
     expect(eventsRaw).toContain('"type":"cancel"');
+    const failure = run.events.find(event => event.type === 'step.failed');
+    expect(failure).toMatchObject({ code: null, timedOut: false, cancelled: true });
+    expect(failure.message).toMatch(/cancelada por el usuario/i);
+  });
+
+  it('registra timeout y stderr sanitizado como evidencia no confiable', async () => {
+    const root = await makeTempRoot();
+    const run = createRun('Implementar una función segura', 'codex');
+    let receivedTimeout;
+    const fakeCodex = {
+      async run(_prompt, ctx) {
+        receivedTimeout = ctx.timeoutMs;
+        return {
+          ok: false,
+          code: null,
+          signal: 'SIGKILL',
+          output: '',
+          stderr: '\u001b[31mtoken=secreto fallo técnico\u001b[0m',
+          ms: 300001,
+          timedOut: true,
+          cancelled: false,
+        };
+      },
+    };
+
+    await startRun(run, root, { codex: fakeCodex });
+
+    expect(receivedTimeout).toBe(300000);
+    expect(run.status).toBe('failed');
+    const failure = run.events.find(event => event.type === 'step.failed');
+    expect(failure).toMatchObject({
+      code: null,
+      signal: 'SIGKILL',
+      timedOut: true,
+      cancelled: false,
+      stderrUntrusted: true,
+    });
+    expect(failure.message).toBe('Implementación detenida: límite de 5 minutos alcanzado.');
+    expect(failure.stderr).toContain('token=[REDACTED]');
+    expect(failure.stderr).not.toContain('secreto');
   });
 });

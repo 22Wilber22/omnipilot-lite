@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { runProcess } from './processRunner.js';
+import { extractUsageFromObject } from '../metrics/usageTracker.js';
 
 const DEFAULT_AVAILABLE_TIMEOUT_MS = 5000;
 const DEFAULT_RUN_TIMEOUT_MS = 65000;
@@ -10,17 +11,36 @@ const agyResponseSchema = z.object({
   status: z.string(),
   response: z.string().optional().default(''),
   duration_seconds: z.number().optional(),
+  usage: z.record(z.unknown()).optional(),
 });
 
-export function buildAntigravityArgs({ prompt }) {
+export function buildAntigravityArgs({ prompt, effort, model } = {}) {
   if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('Prompt requerido');
-  return [
+  const args = [
     '--prompt', prompt.trim(),
     '--output-format', 'json',
     '--mode', 'plan',
     '--sandbox',
-    '--print-timeout', PRINT_TIMEOUT_FLAG,
   ];
+  if (effort === 'low') args.push('--effort', 'low');
+  if (typeof model === 'string' && /^[a-zA-Z0-9._:/-]+$/.test(model.trim())) {
+    args.push('--model', model.trim());
+  }
+  args.push('--print-timeout', PRINT_TIMEOUT_FLAG);
+  return args;
+}
+
+function parseModelList(stdout) {
+  const models = [];
+  for (const line of String(stdout ?? '').split(/\r?\n/)) {
+    const clean = line.trim().replace(/^[-*•]\s+/, '');
+    if (!clean || /^available|^models|^name\b|^---/i.test(clean)) continue;
+    const token = clean.split(/\s+/)[0];
+    if (/^[a-zA-Z0-9._:/-]{3,80}$/.test(token) && !models.includes(token)) {
+      models.push(token);
+    }
+  }
+  return models;
 }
 
 function parseAntigravityOutput(stdout) {
@@ -49,16 +69,24 @@ export function createAntigravityConnector({ command = 'agy', runner = runProces
       };
     },
 
+    async listModels({ timeoutMs = DEFAULT_AVAILABLE_TIMEOUT_MS, signal } = {}) {
+      const result = await runner({ command, args: ['models'], timeoutMs, signal, maxOutput: 16384 });
+      if (result.code !== 0 || result.error || result.timedOut || result.cancelled) return [];
+      return parseModelList(result.stdout);
+    },
+
     async run(task, context = {}) {
       const prompt = typeof task === 'string' ? task : task?.prompt;
       const {
         workspace,
+        effort,
+        model,
         timeoutMs = DEFAULT_RUN_TIMEOUT_MS,
         signal,
         maxOutput = 200000,
       } = context;
       if (typeof workspace !== 'string' || !workspace.trim()) throw new Error('Workspace requerido');
-      const args = buildAntigravityArgs({ prompt });
+      const args = buildAntigravityArgs({ prompt, effort, model });
       const result = await runner({ command, args, cwd: workspace.trim(), timeoutMs, signal, maxOutput });
 
       if (result.timedOut || result.cancelled || result.error || result.code !== 0) {
@@ -99,6 +127,7 @@ export function createAntigravityConnector({ command = 'agy', runner = runProces
       }
 
       const ok = parsed.status === 'SUCCESS';
+      const usage = extractUsageFromObject(parsed);
       return {
         ok,
         code: result.code,
@@ -106,6 +135,7 @@ export function createAntigravityConnector({ command = 'agy', runner = runProces
         untrustedResponse: parsed.response,
         conversationId: parsed.conversation_id ?? null,
         durationSeconds: parsed.duration_seconds ?? null,
+        usage,
         stdout: result.stdout,
         stderr: result.stderr,
         ms: result.ms,

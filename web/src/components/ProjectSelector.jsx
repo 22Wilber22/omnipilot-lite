@@ -59,7 +59,7 @@ export default function ProjectSelector({
       {sourceType === 'template' ? (
         <div className="project-field-grid">
           <label htmlFor="template-acceptance">Prueba de aceptación</label>
-          <select id="template-acceptance" value="password-test" disabled={controlsDisabled} readOnly>
+          <select id="template-acceptance" value="password-test" disabled={controlsDisabled}>
             <option value="password-test">Validación de contraseña integrada</option>
           </select>
         </div>
@@ -86,7 +86,7 @@ export default function ProjectSelector({
               onClick={onInspect}
               disabled={controlsDisabled || !projectPath.trim()}
             >
-              {inspecting ? 'Inspeccionando...' : 'Inspeccionar proyecto'}
+              {inspecting ? 'Inspeccionando...' : (project ? 'Verificar de nuevo' : 'Inspeccionar proyecto')}
             </button>
           </div>
 

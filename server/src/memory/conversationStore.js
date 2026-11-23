@@ -8,9 +8,19 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const messageSchema = z.object({
   id: z.string(),
   role: z.enum(['user', 'orchestrator', 'system']),
+  type: z.enum(['chat', 'plan-conceptual', 'needs-project', 'tarea', 'actividad']).optional().default('chat'),
   text: z.string(),
   createdAt: z.string(),
   runId: z.string().optional(),
+});
+
+export const projectConfigSchema = z.object({
+  sourceType: z.enum(['template', 'local-project']),
+  projectPath: z.string().optional(),
+  projectName: z.string(),
+  acceptanceScript: z.string(),
+  targetScope: z.string().optional(),
+  updatedAt: z.string(),
 });
 
 export const conversationSchema = z.object({
@@ -18,6 +28,7 @@ export const conversationSchema = z.object({
   title: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
+  projectConfig: projectConfigSchema.nullable().default(null),
   messages: z.array(messageSchema),
   runIds: z.array(z.string()),
 });
@@ -77,7 +88,7 @@ export function createConversationStore(baseDir) {
       return readIndex();
     },
 
-    async create({ title = 'Nueva tarea' } = {}) {
+    async create({ title = 'Nueva tarea', projectConfig = null } = {}) {
       await ensureDir();
       const now = new Date().toISOString();
       const conv = conversationSchema.parse({
@@ -85,11 +96,30 @@ export function createConversationStore(baseDir) {
         title: String(title).trim().slice(0, 80) || 'Nueva tarea',
         createdAt: now,
         updatedAt: now,
+        projectConfig: projectConfig ? projectConfigSchema.parse(projectConfig) : null,
         messages: [],
         runIds: [],
       });
       await atomicWriteJson(convPath(conv.id), conv);
       await upsertIndex({ id: conv.id, title: conv.title, updatedAt: conv.updatedAt, status: 'no_plan' });
+      return conv;
+    },
+
+    async setProjectConfig(id, config) {
+      const conv = await this.get(id);
+      if (!conv) return null;
+      const validated = projectConfigSchema.parse({ ...config, updatedAt: new Date().toISOString() });
+      conv.projectConfig = validated;
+      conv.updatedAt = validated.updatedAt;
+      await atomicWriteJson(convPath(conv.id), conv);
+      const list = await readIndex();
+      const existing = list.find(x => x.id === conv.id);
+      await upsertIndex({
+        id: conv.id,
+        title: conv.title,
+        updatedAt: conv.updatedAt,
+        status: existing?.status ?? 'no_plan',
+      });
       return conv;
     },
 
@@ -103,13 +133,14 @@ export function createConversationStore(baseDir) {
       }
     },
 
-    async appendMessage(id, { role, text, runId }) {
+    async appendMessage(id, { role, type = 'chat', text, runId }) {
       const conv = await this.get(id);
       if (!conv) return null;
       const now = new Date().toISOString();
       const msg = messageSchema.parse({
         id: randomUUID(),
         role,
+        type,
         text: String(text).slice(0, 2000),
         createdAt: now,
         ...(runId ? { runId } : {}),

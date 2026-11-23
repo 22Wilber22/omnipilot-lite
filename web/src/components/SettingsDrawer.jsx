@@ -11,14 +11,17 @@ const NEXT_STATUS = {
 };
 
 const USAGE_OPTIONS = ['Mínimo', 'Bajo', 'Medio', 'Alto', 'Máximo'];
+const BUDGET_OPTIONS = [10000, 20000, 40000, 80000];
 
 export default function SettingsDrawer({
   open, onClose,
   token, setToken, mode, setMode,
-  diagnostics, onCheckConnection,
+  diagnostics, onCheckConnection, onDisconnect,
   roles, setRoles,
   skills, setSkills,
   usageLevels, setUsageLevels,
+  budgets, setBudgets,
+  chatSettings, availableModels, onUpdateChatSettings,
   busy, error,
 }) {
   useEffect(() => {
@@ -34,6 +37,7 @@ export default function SettingsDrawer({
   const agyOk = Boolean(diagnostics?.antigravity?.available);
 
   const cycleSkill = (id) => {
+    if (id === 'orchestrator-driven-development') return;
     setSkills(prev => prev.map(s => (s.id === id ? { ...s, status: NEXT_STATUS[s.status] } : s)));
   };
 
@@ -72,7 +76,13 @@ export default function SettingsDrawer({
               <button type="button" className="primary sm" onClick={onCheckConnection} disabled={!token.trim() || busy}>
                 {busy ? 'Verificando...' : 'Verificar'}
               </button>
+              {diagnostics && (
+                <button type="button" className="secondary sm" onClick={onDisconnect} disabled={busy}>
+                  Desconectar
+                </button>
+              )}
             </div>
+            <p className="muted">Tu sesión se conserva mientras esta pestaña permanezca abierta. Si reinicias el servidor, necesitarás un token nuevo.</p>
             {error && <p className="error" role="alert">{error}</p>}
           </section>
 
@@ -96,6 +106,49 @@ export default function SettingsDrawer({
                 <StatusBadge variant="wait">Próximamente</StatusBadge>
               </div>
             </div>
+          </section>
+
+          <section className="settings-block">
+            <h3>Conversación</h3>
+            <div className="kv-list">
+              <div className="kv-row">
+                <label htmlFor="chat-provider">Modelo de conversación</label>
+                <select
+                  id="chat-provider"
+                  value={chatSettings?.chatModel ? `agy:${chatSettings.chatModel}` : (chatSettings?.chatProvider || 'auto')}
+                  onChange={e => {
+                    const val = e.target.value;
+                    if (val.startsWith('agy:')) {
+                      onUpdateChatSettings({ chatProvider: 'antigravity', chatModel: val.slice(4) });
+                    } else {
+                      onUpdateChatSettings({ chatProvider: val, chatModel: null });
+                    }
+                  }}
+                  disabled={!diagnostics || busy}
+                >
+                  <option value="auto">Automático rápido</option>
+                  {(availableModels?.antigravity ?? []).map(m => (
+                    <option key={m} value={`agy:${m}`}>Antigravity · {m}</option>
+                  ))}
+                  {codexOk && <option value="codex">Codex (read-only)</option>}
+                </select>
+              </div>
+              <div className="kv-row">
+                <label htmlFor="chat-style">Estilo de respuesta</label>
+                <select
+                  id="chat-style"
+                  value={chatSettings?.chatStyle || 'fast'}
+                  onChange={e => onUpdateChatSettings({ chatStyle: e.target.value })}
+                  disabled={!diagnostics || busy}
+                >
+                  <option value="fast">Rápido (90 palabras, bajo esfuerzo)</option>
+                  <option value="detailed">Detallado</option>
+                </select>
+              </div>
+            </div>
+            <p className="muted" style={{ marginTop: 8 }}>
+              Usado solo en conversación normal (solo lectura). Implementación y revisión conservan sus agentes.
+            </p>
           </section>
 
           <section className="settings-block">
@@ -150,7 +203,7 @@ export default function SettingsDrawer({
 
           <section className="settings-block">
             <h3>D. Skills sugeridas</h3>
-            <p className="muted">Pulsa una skill para cambiar entre Sugerida, Instalada y Activa.</p>
+            <p className="muted">Pulsa una skill opcional para cambiar su estado. ODD permanece siempre activa.</p>
             <div className="skills-stack">
               {skills.map(skill => (
                 <SkillCard key={skill.id} skill={skill} onToggle={cycleSkill} />
@@ -176,9 +229,21 @@ export default function SettingsDrawer({
                   {USAGE_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
                 </select>
               </div>
+              <div className="kv-row">
+                <label htmlFor="budget-codex">Presupuesto local · Codex</label>
+                <select id="budget-codex" value={budgets.codex} onChange={e => setBudgets(b => ({ ...b, codex: Number(e.target.value) }))}>
+                  {BUDGET_OPTIONS.map(n => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
+                </select>
+              </div>
+              <div className="kv-row">
+                <label htmlFor="budget-agy">Presupuesto local · Antigravity</label>
+                <select id="budget-agy" value={budgets.antigravity} onChange={e => setBudgets(b => ({ ...b, antigravity: Number(e.target.value) }))}>
+                  {BUDGET_OPTIONS.map(n => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
+                </select>
+              </div>
             </div>
             <p className="muted" style={{ marginTop: 8 }}>
-              Controla contexto, salida y esfuerzo cuando el proveedor lo admite. Los límites de seguridad del backend no cambian.
+              Límite local de OmniPilot por ejecución; no representa saldo ni cuota restante de tu cuenta.
             </p>
           </section>
 
