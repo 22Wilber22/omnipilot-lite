@@ -31,6 +31,20 @@ function sanitizeTargetScope(value) {
   return trimmed;
 }
 
+function taskGoalFromPlan(messages, sourceMessageId) {
+  let planIndex = typeof sourceMessageId === 'string'
+    ? messages.findIndex(message => message.id === sourceMessageId && message.type === 'plan-conceptual')
+    : -1;
+  if (planIndex < 0) {
+    planIndex = messages.findLastIndex(message => message.type === 'plan-conceptual');
+  }
+  if (planIndex < 0) throw new Error('Plan conceptual no encontrado');
+  for (let index = planIndex - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user') return messages[index].text.slice(0, 1200);
+  }
+  throw new Error('Mensaje original no encontrado');
+}
+
 export function createApp({
   token,
   port = Number(process.env.PORT ?? 4317),
@@ -209,8 +223,9 @@ export function createApp({
         normalized = {
           sourceType: 'local-project',
           projectPath: validated.projectPath,
-          projectName: validated.projectName || validated.projectPath,
+          projectName: validated.projectPath.split('/').pop() || validated.projectPath,
           acceptanceScript: validated.acceptanceScript,
+          dependencyInstallMode: req.body?.dependencyInstallMode === 'approved-scripts' ? 'approved-scripts' : 'safe',
           ...(targetScope ? { targetScope } : {}),
         };
       } else {
@@ -303,11 +318,17 @@ export function createApp({
         let mode = 'demo';
         if (conv.projectConfig.sourceType === 'local-project') {
           try {
-            source = await validateLocalProjectSource({
+            const validated = await validateLocalProjectSource({
               projectsRoot,
               projectPath: conv.projectConfig.projectPath,
               acceptanceScript: conv.projectConfig.acceptanceScript,
             });
+            source = {
+              type: 'local-project',
+              projectPath: validated.projectPath,
+              acceptanceScript: validated.acceptanceScript,
+              ...(conv.projectConfig.dependencyInstallMode === 'approved-scripts' ? { dependencyInstallMode: 'approved-scripts' } : {}),
+            };
             mode = 'codex';
           } catch (e) {
             const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
@@ -318,8 +339,7 @@ export function createApp({
             return res.status(201).json({ conversation, userMessage, reply, run: null });
           }
         }
-        const lastPlan = [...conv.messages].reverse().find(m => m.type === 'plan-conceptual');
-        const goalText = lastPlan?.text || conv.title || text;
+        const goalText = taskGoalFromPlan(conv.messages);
         const run = createRun(goalText, mode, source, req.body?.budgets, req.body?.activeSkills);
         runToConversation.set(run.id, conv.id);
         await conversations.attachRun(conv.id, run.id, 'plan_pending');
@@ -532,9 +552,15 @@ export function createApp({
     if (!conv.projectConfig) {
       return res.status(400).json({ error: 'Selecciona primero un proyecto y prueba de aceptación.' });
     }
-    const goalText = typeof req.body?.goal === 'string' && req.body.goal.trim()
-      ? req.body.goal.trim().slice(0, 1200)
-      : (conv.messages.find(m => m.role === 'user')?.text || conv.title);
+    let goalText;
+    try {
+      goalText = taskGoalFromPlan(conv.messages, req.body?.sourceMessageId);
+    } catch (error) {
+      if (typeof req.body?.goal !== 'string' || !req.body.goal.trim()) {
+        return res.status(400).json({ error: error.message });
+      }
+      goalText = req.body.goal.trim().slice(0, 1200);
+    }
     const mode = req.body?.mode === 'demo' ? 'demo' : 'codex';
 
     let source;
@@ -545,7 +571,12 @@ export function createApp({
           projectPath: conv.projectConfig.projectPath,
           acceptanceScript: conv.projectConfig.acceptanceScript,
         });
-        source = { type: 'local-project', projectPath: validated.projectPath, acceptanceScript: validated.acceptanceScript };
+        source = {
+          type: 'local-project',
+          projectPath: validated.projectPath,
+          acceptanceScript: validated.acceptanceScript,
+          dependencyInstallMode: conv.projectConfig.dependencyInstallMode === 'approved-scripts' ? 'approved-scripts' : 'safe',
+        };
       } catch (e) {
         return res.status(400).json({ error: e.message });
       }
@@ -650,11 +681,17 @@ export function createApp({
       .catch(e => console.error('Run failure:', e.message))
       .finally(async () => {
         if (!convId) return;
-        const finalStatus = ['completed', 'failed', 'cancelled'].includes(run.status) ? run.status : 'failed';
+        const finalStatus = ['completed', 'failed', 'cancelled', 'baseline_failed', 'acceptance_manifest_changed'].includes(run.status) ? run.status : 'failed';
         await conversations.updateStatus(convId, finalStatus);
         const label = finalStatus === 'completed'
           ? 'Ejecución completada: pruebas aprobadas.'
-          : (finalStatus === 'cancelled' ? 'Ejecución cancelada por el usuario.' : 'Ejecución fallida: revisa la ficha de evidencia.');
+          : (finalStatus === 'cancelled'
+            ? 'Ejecución cancelada por el usuario.'
+            : (finalStatus === 'baseline_failed'
+              ? 'Prueba base fallida: el proyecto no pasa sus pruebas antes de cambios.'
+              : (finalStatus === 'acceptance_manifest_changed'
+                ? 'La definición de la prueba de aceptación cambió durante la ejecución.'
+                : 'Ejecución fallida: revisa la ficha de evidencia.')));
         await conversations.appendMessage(convId, { role: 'orchestrator', text: label, runId: run.id }).catch(() => {});
       });
 

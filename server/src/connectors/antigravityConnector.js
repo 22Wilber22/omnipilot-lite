@@ -1,6 +1,14 @@
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { z } from 'zod';
 import { runProcess } from './processRunner.js';
 import { extractUsageFromObject } from '../metrics/usageTracker.js';
+
+function resolveDefaultAgyCommand() {
+  const localBin = join(homedir(), '.local', 'bin', 'agy');
+  return existsSync(localBin) ? localBin : 'agy';
+}
 
 const DEFAULT_AVAILABLE_TIMEOUT_MS = 5000;
 const DEFAULT_RUN_TIMEOUT_MS = 65000;
@@ -14,12 +22,13 @@ const agyResponseSchema = z.object({
   usage: z.record(z.unknown()).optional(),
 });
 
-export function buildAntigravityArgs({ prompt, effort, model } = {}) {
+export function buildAntigravityArgs({ prompt, effort, model, mode = 'plan' } = {}) {
   if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('Prompt requerido');
+  const safeMode = mode === 'accept-edits' ? 'accept-edits' : 'plan';
   const args = [
     '--prompt', prompt.trim(),
     '--output-format', 'json',
-    '--mode', 'plan',
+    '--mode', safeMode,
     '--sandbox',
   ];
   if (effort === 'low') args.push('--effort', 'low');
@@ -81,12 +90,13 @@ export function createAntigravityConnector({ command = 'agy', runner = runProces
         workspace,
         effort,
         model,
+        mode = 'plan',
         timeoutMs = DEFAULT_RUN_TIMEOUT_MS,
         signal,
         maxOutput = 200000,
       } = context;
       if (typeof workspace !== 'string' || !workspace.trim()) throw new Error('Workspace requerido');
-      const args = buildAntigravityArgs({ prompt, effort, model });
+      const args = buildAntigravityArgs({ prompt, effort, model, mode });
       const result = await runner({ command, args, cwd: workspace.trim(), timeoutMs, signal, maxOutput });
 
       if (result.timedOut || result.cancelled || result.error || result.code !== 0) {
@@ -148,4 +158,4 @@ export function createAntigravityConnector({ command = 'agy', runner = runProces
   };
 }
 
-export const antigravityConnector = createAntigravityConnector();
+export const antigravityConnector = createAntigravityConnector({ command: resolveDefaultAgyCommand() });

@@ -1,4 +1,31 @@
-const API = 'http://127.0.0.1:4317';
+export const API = 'http://127.0.0.1:4317';
+const SAFE_FILENAME_RE = /^[A-Za-z0-9._-]+$/;
+
+export async function fetchRunArtifact(token, path, { expectedContentType, fallbackFilename, fetchImpl = fetch } = {}) {
+  const res = await fetchImpl(API + path, {
+    method: 'GET',
+    headers: { 'X-Omni-Token': token },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `No se pudo descargar (${res.status})`);
+  }
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (contentType.includes('text/html')) {
+    throw new Error('La descarga recibió una respuesta inesperada de la interfaz local.');
+  }
+  if (expectedContentType && !contentType.includes(expectedContentType)) {
+    throw new Error('Tipo de archivo inesperado en la descarga.');
+  }
+  const cd = res.headers.get('content-disposition') || '';
+  const match = cd.match(/filename="([^"]+)"/);
+  const candidate = match?.[1] || '';
+  const filename = SAFE_FILENAME_RE.test(candidate) && !candidate.includes('..')
+    ? candidate
+    : fallbackFilename;
+  const blob = await res.blob();
+  return { blob, filename };
+}
 
 export async function apiRequest(token, path, { method = 'GET', body } = {}) {
   const res = await fetch(API + path, {

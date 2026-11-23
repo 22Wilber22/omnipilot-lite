@@ -14,7 +14,7 @@ async function makeTempDir() {
   return dir;
 }
 
-async function startServer({ codex, antigravity } = {}) {
+async function startServer({ codex = { async isAvailable() { return { available: false }; } }, antigravity } = {}) {
   const ws = await makeTempDir();
   const data = await makeTempDir();
   const port = 4600 + Math.floor(Math.random() * 350);
@@ -161,6 +161,7 @@ describe('Sprint — Continuidad del orquestador y reintento conversacional', ()
 
     expect(res.run).toBeTruthy();
     expect(res.run.status).toBe('pending');
+    expect(res.run.goal).toBe('Preparar plan');
     expect(res.reply.type).toBe('tarea');
   });
 

@@ -87,6 +87,7 @@ export async function buildEvidenceDocument({ runId, workspacesDir, run = null }
     duracionMs: durationMs,
     reintentos: retries,
     estado: run?.status || 'completed',
+    preflight: memory.preflight || null,
     resultados: {
       pasos: steps.map(s => ({
         id: s.id,

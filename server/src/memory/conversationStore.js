@@ -31,6 +31,7 @@ export const projectConfigSchema = z.object({
   projectName: z.string(),
   acceptanceScript: z.string(),
   targetScope: z.string().optional(),
+  dependencyInstallMode: z.enum(['safe', 'approved-scripts']).optional().default('safe'),
   updatedAt: z.string(),
 });
 
@@ -49,7 +50,7 @@ const indexEntrySchema = z.object({
   id: z.string(),
   title: z.string(),
   updatedAt: z.string(),
-  status: z.enum(['no_plan', 'plan_pending', 'running', 'completed', 'failed', 'cancelled']).default('no_plan'),
+  status: z.enum(['no_plan', 'plan_pending', 'running', 'completed', 'failed', 'cancelled', 'baseline_failed', 'acceptance_manifest_changed']).default('no_plan'),
 });
 
 const indexSchema = z.array(indexEntrySchema);

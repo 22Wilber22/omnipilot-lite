@@ -63,7 +63,7 @@ describe('usageTracker — presupuesto local por proveedor', () => {
       },
     };
     const run = createRun('Probar corte por presupuesto', 'codex', { type: 'template' }, { codex: 1000 });
-    await startRun(run, root, { codex: fakeCodex, antigravityValidated: false });
+    await startRun(run, root, { codex: fakeCodex, antigravityValidated: false, enforceBudget: true });
 
     expect(run.status).toBe('failed');
     expect(codexCalls).toBe(1);

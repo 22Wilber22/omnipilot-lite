@@ -1,6 +1,26 @@
 import { cp, lstat, readFile, readdir, realpath } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, relative, resolve, win32 } from 'node:path';
+
+export const ALLOWED_ACCEPTANCE_SCRIPTS = Object.freeze([
+  'test',
+  'test:unit',
+  'test:integration',
+  'lint',
+  'check',
+  'build',
+]);
+const ALLOWED_SCRIPTS_SET = new Set(ALLOWED_ACCEPTANCE_SCRIPTS);
+const SAFE_SCRIPT_NAME_RE = /^[a-z0-9:_-]{1,40}$/;
+
+function sha256(text) {
+  return createHash('sha256').update(String(text), 'utf8').digest('hex');
+}
+
+export function isAllowedAcceptanceScript(name) {
+  return typeof name === 'string' && SAFE_SCRIPT_NAME_RE.test(name) && ALLOWED_SCRIPTS_SET.has(name);
+}
 
 const EXCLUDED_DIRECTORIES = new Set(['node_modules', '.git', '.aws', '.ssh']);
 const EXCLUDED_FILES = new Set([
@@ -136,7 +156,7 @@ export async function inspectLocalProject({ projectsRoot, projectPath }) {
   return {
     name: packageInfo.name,
     projectPath: project.projectPath,
-    scripts: Object.keys(packageInfo.scripts).sort(),
+    scripts: Object.keys(packageInfo.scripts).filter(isAllowedAcceptanceScript).sort(),
     isGitRepository: await hasGitMetadata(project.sourceDir),
   };
 }
@@ -145,13 +165,87 @@ export async function validateLocalProjectSource({ projectsRoot, projectPath, ac
   if (typeof acceptanceScript !== 'string' || !acceptanceScript.trim()) {
     throw new Error('acceptanceScript requerido');
   }
+  const script = acceptanceScript.trim();
+  if (!isAllowedAcceptanceScript(script)) {
+    throw new Error(`Script de aceptación inexistente o no permitido por la allowlist segura: ${script}`);
+  }
   const project = await resolveProject(projectsRoot, projectPath);
   const packageInfo = await readPackage(project.sourceDir);
-  const script = acceptanceScript.trim();
   if (!Object.hasOwn(packageInfo.scripts, script)) {
     throw new Error(`Script de aceptación inexistente: ${script}`);
   }
   return { type: 'local-project', projectPath: project.projectPath, acceptanceScript: script };
+}
+
+export async function captureAcceptanceManifest(workspaceDir, scriptName) {
+  if (!isAllowedAcceptanceScript(scriptName)) {
+    throw new Error(`Script de aceptación no permitido por la allowlist segura: ${scriptName}`);
+  }
+  const rawPkg = await readFile(join(workspaceDir, 'package.json'), 'utf8');
+  const pkg = JSON.parse(rawPkg);
+  const scriptDefinition = pkg?.scripts?.[scriptName];
+  if (typeof scriptDefinition !== 'string' || !scriptDefinition.trim()) {
+    throw new Error(`Script de aceptación inexistente: ${scriptName}`);
+  }
+  let lockfileHash = null;
+  try {
+    const rawLock = await readFile(join(workspaceDir, 'package-lock.json'), 'utf8');
+    lockfileHash = sha256(rawLock);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  return Object.freeze({
+    scriptName,
+    scriptDefinition,
+    packageJsonHash: sha256(rawPkg),
+    lockfileHash,
+  });
+}
+
+export async function verifyAcceptanceManifest(workspaceDir, manifest) {
+  if (!manifest || !isAllowedAcceptanceScript(manifest.scriptName)) {
+    const err = new Error('La definición de la prueba de aceptación cambió durante la ejecución.');
+    err.runStatus = 'acceptance_manifest_changed';
+    throw err;
+  }
+  let rawPkg;
+  try {
+    rawPkg = await readFile(join(workspaceDir, 'package.json'), 'utf8');
+  } catch {
+    const err = new Error('La definición de la prueba de aceptación cambió durante la ejecución.');
+    err.runStatus = 'acceptance_manifest_changed';
+    throw err;
+  }
+  let pkg;
+  try {
+    pkg = JSON.parse(rawPkg);
+  } catch {
+    const err = new Error('La definición de la prueba de aceptación cambió durante la ejecución.');
+    err.runStatus = 'acceptance_manifest_changed';
+    throw err;
+  }
+  const currentDef = pkg?.scripts?.[manifest.scriptName];
+  if (currentDef !== manifest.scriptDefinition || sha256(rawPkg) !== manifest.packageJsonHash) {
+    const err = new Error('La definición de la prueba de aceptación cambió durante la ejecución.');
+    err.runStatus = 'acceptance_manifest_changed';
+    throw err;
+  }
+  if (manifest.lockfileHash) {
+    let rawLock;
+    try {
+      rawLock = await readFile(join(workspaceDir, 'package-lock.json'), 'utf8');
+    } catch {
+      const err = new Error('La definición de la prueba de aceptación cambió durante la ejecución.');
+      err.runStatus = 'acceptance_manifest_changed';
+      throw err;
+    }
+    if (sha256(rawLock) !== manifest.lockfileHash) {
+      const err = new Error('La definición de la prueba de aceptación cambió durante la ejecución.');
+      err.runStatus = 'acceptance_manifest_changed';
+      throw err;
+    }
+  }
+  return true;
 }
 
 export async function copyLocalProject({ projectsRoot, projectPath, acceptanceScript, destination }) {

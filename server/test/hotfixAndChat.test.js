@@ -150,9 +150,10 @@ describe('SPRINT — Chat ligero con orquestador configurable', () => {
     const converted = await (await fetch(`${baseUrl}/api/conversations/${conv.id}/convert-to-task`, {
       method: 'POST',
       headers: { 'X-Omni-Token': token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ goal: pBody.reply.text, mode: 'codex' }),
+      body: JSON.stringify({ sourceMessageId: pBody.reply.id, mode: 'codex' }),
     })).json();
     expect(converted.run.status).toBe('pending');
+    expect(converted.run.goal).toBe('Planifica cómo mejorar el chat');
     expect(converted.reply.type).toBe('tarea');
 
     // 5. Unavailable provider replies cleanly without executing

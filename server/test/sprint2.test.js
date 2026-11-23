@@ -211,7 +211,7 @@ describe('Sprint 2 — ejecución trazable con Codex (conectores falsos)', () =>
 
     await startRun(run, root, { codex: fakeCodex });
 
-    expect(receivedTimeout).toBe(300000);
+    expect(receivedTimeout).toBe(120000);
     expect(run.status).toBe('failed');
     const failure = run.events.find(event => event.type === 'step.failed');
     expect(failure).toMatchObject({

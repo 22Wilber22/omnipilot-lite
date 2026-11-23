@@ -25,6 +25,7 @@ const sourceSchema = z.discriminatedUnion('type', [
     type: z.literal('local-project'),
     projectPath: z.string(),
     acceptanceScript: z.string(),
+    dependencyInstallMode: z.enum(['safe', 'approved-scripts']).optional(),
   }),
 ]);
 
@@ -52,6 +53,12 @@ export const memorySchema = z.object({
   decisions: z.array(z.string()).default([]),
   steps: z.array(stepSchema),
   problems: z.array(z.string()),
+  preflight: z.object({
+    dependencyInstallMode: z.enum(['safe', 'approved-scripts']).default('safe'),
+    installStatus: z.string().default('skipped'),
+    baselineStatus: z.string().default('skipped'),
+  }).optional(),
+  verificationOutput: z.string().optional(),
   updatedAt: z.string(),
 });
 

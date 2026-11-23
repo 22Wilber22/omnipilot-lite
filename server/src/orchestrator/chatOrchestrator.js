@@ -15,6 +15,12 @@ const INVENTED_CONTROLS_RE = /(cambia(?:r)?\s+a\s+modo\s+ejecuci[oó]n|modo\s+ej
 
 export const ALLOWED_CHAT_ACTIONS = ['prepare-plan', 'convert-to-task', 'select-project'];
 
+const QUOTA_ERROR_RE = /(insufficient_quota|quota\s+exceeded|usage\s+limit|out\s+of\s+credits|rate_limit|billing|429|sin\s+cr[eé]dito)/i;
+
+function isQuotaFailure(res) {
+  return QUOTA_ERROR_RE.test(`${res?.error || ''} ${res?.stderr || ''} ${res?.output || ''}`);
+}
+
 export const orchestratorReplySchema = z.object({
   reply: z.string().min(1),
   intent: z.enum(['chat', 'conceptual-plan', 'needs-project', 'ready-to-execute']).default('chat'),
@@ -192,55 +198,57 @@ export async function runOrchestratorChat({
     };
   }
 
-  if (chosen === 'antigravity') {
+  const tryAntigravity = async () => {
     const res = await antigravity.run(prompt, { workspace, effort, model: provider === 'antigravity' ? model : null, timeoutMs: CHAT_TIMEOUT_MS });
     if (!res.ok) {
+      const quota = isQuotaFailure(res);
       const errorCause = res.timedOut ? 'timeout' : 'provider-unavailable';
       return {
         ok: false,
         type: 'chat-error',
         errorCause,
         provider: 'antigravity',
-        text: errorCause === 'timeout'
-          ? 'El proveedor tardó más de 30 s.'
-          : 'No se pudo obtener respuesta de Antigravity.',
+        text: quota
+          ? 'Antigravity reportó límite de cuota.'
+          : (errorCause === 'timeout' ? 'El proveedor tardó más de 30 s.' : 'No se pudo obtener respuesta de Antigravity.'),
       };
     }
     const structured = parseStructuredOrchestratorReply(res.untrustedResponse, messageType);
     if (!structured) {
+      return { ok: false, type: 'chat-error', errorCause: 'empty-response', provider: 'antigravity', text: 'Antigravity devolvió una respuesta vacía.' };
+    }
+    return { ok: true, type: structured.type, actions: structured.actions, provider: 'antigravity', text: structured.text };
+  };
+
+  const tryCodex = async () => {
+    const res = await codex.run(prompt, { workspace, sandbox: 'read-only', timeoutMs: CHAT_TIMEOUT_MS });
+    if (!res.ok) {
+      const quota = isQuotaFailure(res);
+      const errorCause = res.timedOut ? 'timeout' : 'provider-unavailable';
       return {
         ok: false,
         type: 'chat-error',
-        errorCause: 'empty-response',
-        provider: 'antigravity',
-        text: 'Antigravity devolvió una respuesta vacía.',
+        errorCause,
+        provider: 'codex',
+        text: quota
+          ? 'Codex reportó falta de crédito o límite de cuota.'
+          : (errorCause === 'timeout' ? 'El proveedor tardó más de 30 s.' : 'No se pudo obtener respuesta de Codex.'),
       };
     }
-    return { ok: true, type: structured.type, actions: structured.actions, provider: 'antigravity', text: structured.text };
+    const structured = parseStructuredOrchestratorReply(res.output, messageType);
+    if (!structured) {
+      return { ok: false, type: 'chat-error', errorCause: 'empty-response', provider: 'codex', text: 'Codex devolvió una respuesta vacía.' };
+    }
+    return { ok: true, type: structured.type, actions: structured.actions, provider: 'codex', text: structured.text };
+  };
+
+  if (chosen === 'antigravity') {
+    const first = await tryAntigravity();
+    if (first.ok || provider !== 'auto' || !codexOk) return first;
+    return tryCodex();
   }
 
-  const res = await codex.run(prompt, { workspace, sandbox: 'read-only', timeoutMs: CHAT_TIMEOUT_MS });
-  if (!res.ok) {
-    const errorCause = res.timedOut ? 'timeout' : 'provider-unavailable';
-    return {
-      ok: false,
-      type: 'chat-error',
-      errorCause,
-      provider: 'codex',
-      text: errorCause === 'timeout'
-        ? 'El proveedor tardó más de 30 s.'
-        : 'No se pudo obtener respuesta de Codex.',
-    };
-  }
-  const structured = parseStructuredOrchestratorReply(res.output, messageType);
-  if (!structured) {
-    return {
-      ok: false,
-      type: 'chat-error',
-      errorCause: 'empty-response',
-      provider: 'codex',
-      text: 'Codex devolvió una respuesta vacía.',
-    };
-  }
-  return { ok: true, type: structured.type, actions: structured.actions, provider: 'codex', text: structured.text };
+  const first = await tryCodex();
+  if (first.ok || provider !== 'auto' || !agyOk) return first;
+  return tryAntigravity();
 }

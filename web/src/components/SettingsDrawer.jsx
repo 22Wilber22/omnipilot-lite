@@ -127,10 +127,11 @@ export default function SettingsDrawer({
                   disabled={!diagnostics || busy}
                 >
                   <option value="auto">Automático rápido</option>
+                  <option value="antigravity">Antigravity (predeterminado)</option>
                   {(availableModels?.antigravity ?? []).map(m => (
                     <option key={m} value={`agy:${m}`}>Antigravity · {m}</option>
                   ))}
-                  {codexOk && <option value="codex">Codex (read-only)</option>}
+                  <option value="codex">Codex (read-only)</option>
                 </select>
               </div>
               <div className="kv-row">
@@ -160,10 +161,10 @@ export default function SettingsDrawer({
                 value={roles.plan}
                 onChange={v => setRoles(r => ({ ...r, plan: v }))}
                 options={[
-                  { value: 'antigravity', label: 'Antigravity', disabled: diagnostics && !agyOk },
+                  { value: 'antigravity', label: 'Antigravity' },
                   { value: 'codex', label: 'Codex' },
                 ]}
-                note={diagnostics && !agyOk ? 'Antigravity no disponible: usa Codex.' : ''}
+                note={diagnostics && !agyOk ? 'Antigravity no detectado aún (hará fallback si no está disponible).' : ''}
               />
               <RoleSelect
                 id="role-implement"
@@ -179,7 +180,7 @@ export default function SettingsDrawer({
                 value={roles.review}
                 onChange={v => setRoles(r => ({ ...r, review: v }))}
                 options={[
-                  { value: 'antigravity', label: 'Antigravity', disabled: diagnostics && !agyOk },
+                  { value: 'antigravity', label: 'Antigravity' },
                   { value: 'codex-readonly', label: 'Codex (solo lectura)' },
                 ]}
               />

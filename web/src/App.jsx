@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { apiRequest, streamRunEvents } from './apiClient.js';
+import { apiRequest, fetchRunArtifact, streamRunEvents } from './apiClient.js';
 import { IconLogo, IconSettings } from './components/Icons.jsx';
 import Sidebar from './components/Sidebar.jsx';
 import ChatsDrawer from './components/ChatsDrawer.jsx';
@@ -38,6 +38,7 @@ export default function App() {
   const [projectPath, setProjectPath] = useState('');
   const [inspectedProject, setInspectedProject] = useState(null);
   const [acceptanceScript, setAcceptanceScript] = useState('');
+  const [dependencyInstallMode, setDependencyInstallMode] = useState('safe');
   const [inspectingProject, setInspectingProject] = useState(false);
   const [projectError, setProjectError] = useState('');
 
@@ -81,7 +82,10 @@ export default function App() {
 
   function applyProjectConfig(cfg) {
     if (!cfg) return;
+    setSavedProjectConfig(cfg);
     setSourceType(cfg.sourceType);
+    setTargetScope(cfg.targetScope || '');
+    setDependencyInstallMode(cfg.dependencyInstallMode === 'approved-scripts' ? 'approved-scripts' : 'safe');
     if (cfg.sourceType === 'local-project') {
       setProjectPath(cfg.projectPath || '');
       setAcceptanceScript(cfg.acceptanceScript || '');
@@ -300,13 +304,17 @@ export default function App() {
         setActiveConvId(convId);
       }
       if (sourceType === 'local-project' && inspectedProject && acceptanceScript) {
-        await saveProjectConfig(convId, {
+        const saved = await saveProjectConfig(convId, {
           sourceType: 'local-project',
           projectPath: inspectedProject.projectPath,
           acceptanceScript,
+          targetScope,
+          dependencyInstallMode,
         });
+        if (saved) applyProjectConfig(saved);
       } else if (sourceType === 'template') {
-        await saveProjectConfig(convId, { sourceType: 'template' });
+        const saved = await saveProjectConfig(convId, { sourceType: 'template', targetScope });
+        if (saved) applyProjectConfig(saved);
       }
       const res = await apiRequest(token, `/api/conversations/${convId}/messages`, {
         method: 'POST',
@@ -336,7 +344,7 @@ export default function App() {
     }
   }
 
-  async function handleConvertToTask(planText) {
+  async function handleConvertToTask(sourceMessageId) {
     if (!activeConvId) return;
     setShowProjectPicker(true);
     if (sourceType === 'local-project' && (!inspectedProject || !acceptanceScript)) {
@@ -346,16 +354,17 @@ export default function App() {
     try {
       setBusy(true);
       setError('');
-      await saveProjectConfig(
+      const saved = await saveProjectConfig(
         activeConvId,
         sourceType === 'local-project'
-          ? { sourceType: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript }
-          : { sourceType: 'template' },
+          ? { sourceType: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript, targetScope, dependencyInstallMode }
+          : { sourceType: 'template', targetScope },
       );
+      if (saved) applyProjectConfig(saved);
       const activeSkillIds = skills.filter(s => s.status === 'active').map(s => s.id);
       const res = await apiRequest(token, `/api/conversations/${activeConvId}/convert-to-task`, {
         method: 'POST',
-        body: { goal: planText, mode: sourceType === 'local-project' ? 'codex' : mode, budgets, activeSkills: activeSkillIds },
+        body: { sourceMessageId, mode: sourceType === 'local-project' ? 'codex' : mode, budgets, activeSkills: activeSkillIds },
       });
       setMessages(res.conversation.messages ?? []);
       if (res.run) {
@@ -433,19 +442,11 @@ export default function App() {
     }
   }
 
-  async function downloadRunArtifact(path, fallbackFilename) {
+  async function downloadRunArtifact(path, expectedContentType, fallbackFilename) {
     if (!token) return;
     setError('');
     try {
-      const res = await fetch(path, { headers: { 'X-Omni-Token': token } });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || `No se pudo descargar (${res.status})`);
-      }
-      const blob = await res.blob();
-      const cd = res.headers.get('Content-Disposition') || '';
-      const match = cd.match(/filename="([^"]+)"/);
-      const filename = match ? match[1] : fallbackFilename;
+      const { blob, filename } = await fetchRunArtifact(token, path, { expectedContentType, fallbackFilename });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -540,8 +541,8 @@ export default function App() {
           onApprove={approveRun}
           onCancel={cancelActiveRun}
           onNewTask={handleNewTask}
-          onDownloadEvidence={runId => downloadRunArtifact(`/api/runs/${encodeURIComponent(runId)}/evidence`, `omnipilot-evidence-${runId}.json`)}
-          onDownloadPatch={runId => downloadRunArtifact(`/api/runs/${encodeURIComponent(runId)}/patch`, `omnipilot-changes-${runId}.diff`)}
+          onDownloadEvidence={runId => downloadRunArtifact(`/api/runs/${encodeURIComponent(runId)}/evidence`, 'application/json', `omnipilot-evidence-${runId}.json`)}
+          onDownloadPatch={runId => downloadRunArtifact(`/api/runs/${encodeURIComponent(runId)}/patch`, 'text/x-diff', `omnipilot-changes-${runId}.diff`)}
           onOpenSettings={() => setSettingsOpen(true)}
           showProjectPicker={showProjectPicker}
           onToggleProjectPicker={() => setShowProjectPicker(v => !v)}
@@ -625,10 +626,10 @@ export default function App() {
             setActiveConvId(convId);
           }
           const cfg = sourceType === 'local-project'
-            ? { sourceType: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript, targetScope }
+            ? { sourceType: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript, targetScope, dependencyInstallMode }
             : { sourceType: 'template', targetScope };
           const saved = await saveProjectConfig(convId, cfg);
-          if (saved) setSavedProjectConfig(saved);
+          if (saved) applyProjectConfig(saved);
           setShowProjectPicker(false);
         }}
         projectConfig={{
@@ -646,6 +647,8 @@ export default function App() {
         }}
         targetScope={targetScope}
         setTargetScope={setTargetScope}
+        dependencyInstallMode={dependencyInstallMode}
+        setDependencyInstallMode={setDependencyInstallMode}
         disabled={!diagnostics || busy}
       />
     </div>

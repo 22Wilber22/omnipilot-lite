@@ -49,7 +49,7 @@ export default function ChatWorkspace({
   const agyAvailable = Boolean(diagnostics?.antigravity?.available);
   const isPending = run?.status === 'pending';
   const isRunning = run?.status === 'running';
-  const isTerminal = run && ['completed', 'failed', 'cancelled'].includes(run.status);
+  const isTerminal = run && ['completed', 'failed', 'cancelled', 'baseline_failed', 'acceptance_manifest_changed'].includes(run.status);
 
   useEffect(() => {
     const reduced = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -144,7 +144,7 @@ export default function ChatWorkspace({
               )}
               {(m.type === 'plan-conceptual' || m.actions?.includes('convert-to-task')) && !run && (
                 <div className="inline-actions">
-                  <button type="button" className="primary sm" onClick={() => onConvertToTask(m.text)} disabled={busy}>
+                  <button type="button" className="primary sm" onClick={() => onConvertToTask(m.id)} disabled={busy}>
                     Convertir en tarea
                   </button>
                 </div>
@@ -213,7 +213,10 @@ export default function ChatWorkspace({
             </p>
             <div className="run-source-summary">
               <span><strong>Fuente</strong> {sourceName}</span>
-              <span><strong>Prueba</strong> <code>{acceptanceLabel}</code></span>
+              <span>
+                <strong>Prueba</strong> <code>{acceptanceLabel}</code>{' '}
+                <span className="badge ok" title="La IA no puede cambiar la prueba de aceptación durante la tarea.">Prueba bloqueada</span>
+              </span>
               <small>OmniPilot trabaja sobre una copia temporal. Tu proyecto original no se modifica.</small>
             </div>
             <ol className="plan-compact">
@@ -266,6 +269,13 @@ export default function ChatWorkspace({
                   <span key={f} className="file-chip"><IconFile /> {f}</span>
                 ))}
               </div>
+            )}
+
+            {(run.memory?.verificationOutput || [...events].reverse().find(e => e.type === 'verification.completed' && e.output)?.output) && (
+              <details className="fold-block">
+                <summary>Detalle de prueba fallida</summary>
+                <pre className="logs">{run.memory?.verificationOutput || [...events].reverse().find(e => e.type === 'verification.completed' && e.output)?.output}</pre>
+              </details>
             )}
 
             <details className="fold-block">
@@ -349,6 +359,9 @@ export default function ChatWorkspace({
               : 'Plantilla de demostración · test'}`
             : 'Elegir proyecto'}
         </button>
+        {projectConfig.savedConfig?.dependencyInstallMode === 'approved-scripts' && (
+          <span className="badge warn">Instalación npm: scripts aprobados</span>
+        )}
       </div>
 
       <ChatComposer

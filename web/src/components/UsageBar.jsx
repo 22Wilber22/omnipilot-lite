@@ -1,10 +1,10 @@
 const LEVEL_META = {
-  unavailable: { label: 'Uso no reportado por el proveedor', cls: 'empty' },
-  idle: { label: 'Sin uso', cls: 'empty' },
-  low: { label: 'Uso bajo', cls: 'ok' },
-  medium: { label: 'Uso medio', cls: 'warn' },
-  high: { label: 'Uso alto', cls: 'danger' },
-  limit: { label: 'Límite alcanzado', cls: 'danger' },
+  unavailable: { label: 'Uso observado no reportado', cls: 'empty' },
+  idle: { label: 'Uso observado: sin datos', cls: 'empty' },
+  low: { label: 'Uso observado bajo', cls: 'ok' },
+  medium: { label: 'Uso observado medio', cls: 'warn' },
+  high: { label: 'Uso observado alto', cls: 'danger' },
+  limit: { label: 'Uso observado elevado', cls: 'danger' },
 };
 
 export default function UsageBar({ usage, label = 'Consumo local' }) {
@@ -21,7 +21,7 @@ export default function UsageBar({ usage, label = 'Consumo local' }) {
     <div className="usage-wrap tip-wrap" tabIndex={0} aria-label={`${label}: ${meta.label}`}>
       <div className="usage-head">
         <span className="usage-label">{meta.label}</span>
-        {level === 'limit' && <span className="badge fail">Límite</span>}
+        {level === 'limit' && <span className="badge fail">Alto</span>}
       </div>
       <div className="usage-segments" aria-hidden="true">
         {Array.from({ length: 10 }, (_, i) => (

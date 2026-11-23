@@ -5,6 +5,7 @@ import ProjectSelector from './ProjectSelector.jsx';
 export default function ProjectModal({
   open, onClose, onConfirm,
   projectConfig, targetScope, setTargetScope,
+  dependencyInstallMode, setDependencyInstallMode,
   disabled,
 }) {
   useEffect(() => {
@@ -60,6 +61,22 @@ export default function ProjectModal({
             />
             <p className="muted">Solo orienta al agente; el proyecto completo sigue siendo el límite de seguridad.</p>
           </section>
+
+          {projectConfig.sourceType === 'local-project' && (
+            <section className="settings-block">
+              <label className="row-inline" htmlFor="allow-npm-scripts" style={{ cursor: 'pointer' }}>
+                <input
+                  id="allow-npm-scripts"
+                  type="checkbox"
+                  checked={dependencyInstallMode === 'approved-scripts'}
+                  onChange={e => setDependencyInstallMode?.(e.target.checked ? 'approved-scripts' : 'safe')}
+                  disabled={disabled}
+                />
+                <span>Permitir scripts de instalación de npm en la copia temporal</span>
+              </label>
+              <p className="muted">Solo úsalo para proyectos confiables. Los scripts pueden ejecutar código durante npm ci.</p>
+            </section>
+          )}
 
           <button type="button" className="primary full" onClick={onConfirm} disabled={!canConfirm || disabled}>
             Usar este proyecto

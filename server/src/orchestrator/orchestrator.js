@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { mkdir, writeFile, appendFile } from 'node:fs/promises';
+import { mkdir, writeFile, appendFile, readFile, access } from 'node:fs/promises';
 import { createPlan } from './plan.js';
 import { route } from './router.js';
 import { newMemory, writeMemory, buildBoundedContext } from '../memory/store.js';
@@ -8,7 +8,8 @@ import { runProcess } from '../connectors/processRunner.js';
 import { codexConnector } from '../connectors/codexConnector.js';
 import { antigravityConnector } from '../connectors/antigravityConnector.js';
 import { resolveSafeWorkspacePath, initGitWorkspace, commitBaseline, captureGitPatch, getGitStatus } from '../security/workspaceGuard.js';
-import { copyLocalProject, isExcludedProjectPath } from '../projects/localProjects.js';
+import { redact } from '../security/runArtifacts.js';
+import { copyLocalProject, isExcludedProjectPath, captureAcceptanceManifest, verifyAcceptanceManifest } from '../projects/localProjects.js';
 import { createUsageState, recordProviderUsage, isBudgetExceeded } from '../metrics/usageTracker.js';
 import { normalizeActiveSkillIds, buildSkillRulesForRole, buildOddDelegation } from './oddSkills.js';
 import { buildAgentFailure } from './failureEvidence.js';
@@ -16,8 +17,8 @@ import { buildAgentFailure } from './failureEvidence.js';
 const runs = new Map();
 const ALLOWED_MODES = new Set(['demo', 'codex']);
 const ACCEPTANCE_COMMAND = 'node --test password.test.js';
-export const AGENT_STEP_TIMEOUT_MS = 5 * 60 * 1000;
-export const EXECUTION_TIMEOUT_MS = 15 * 60 * 1000;
+export const AGENT_STEP_TIMEOUT_MS = 2 * 60 * 1000;
+export const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
 
 const demoSource = `export function validatePassword(password) {\n  return typeof password === 'string' && password.length >= 8 && /[A-Z]/.test(password) && /[a-z]/.test(password) && /[0-9]/.test(password);\n}\n`;
 const testSource = `import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { validatePassword } from './password.js';\ntest('valid password',()=>assert.equal(validatePassword('Password123'),true));\ntest('too short',()=>assert.equal(validatePassword('Pa1'),false));\ntest('no uppercase',()=>assert.equal(validatePassword('password123'),false));\ntest('no number',()=>assert.equal(validatePassword('PasswordOnly'),false));\n`;
@@ -31,6 +32,7 @@ function normalizeRunSource(source) {
     type: 'local-project',
     projectPath: source.projectPath.trim(),
     acceptanceScript: source.acceptanceScript.trim(),
+    ...(source.dependencyInstallMode === 'approved-scripts' ? { dependencyInstallMode: 'approved-scripts' } : {}),
   };
 }
 
@@ -110,6 +112,122 @@ function updateDelegation(run, phase, patch) {
   if (item) Object.assign(item, patch);
 }
 
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
+function sanitizeOutput(stdout = '', stderr = '', maxLen = 1500) {
+  const combined = [String(stderr || '').trim(), String(stdout || '').trim()].filter(Boolean).join('\n');
+  const clean = redact(combined.replace(ANSI_RE, '')).trim();
+  return clean.length > maxLen ? clean.slice(-maxLen) : clean;
+}
+
+function isTransientVitestIpcFailure(result) {
+  if (!result || result.code === 0 || result.timedOut || result.cancelled) return false;
+  const output = `${result.stderr || ''}\n${result.stdout || ''}`;
+  return /ERR_INVALID_ARG_TYPE/.test(output)
+    && /(?:vitest|tinypool)/i.test(output)
+    && /deserialize/i.test(output);
+}
+
+function isVitestAcceptance(manifest) {
+  return typeof manifest?.scriptDefinition === 'string'
+    && /(^|[\s;&|])vitest(?:\s|$)/i.test(manifest.scriptDefinition);
+}
+
+async function fileExists(p) {
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runDependencyPreflight({ run, workspace, runner, signal, logEvent }) {
+  const mode = run.source.dependencyInstallMode === 'approved-scripts' ? 'approved-scripts' : 'safe';
+  run.memory.preflight = {
+    dependencyInstallMode: mode,
+    installStatus: 'skipped',
+    baselineStatus: 'skipped',
+  };
+
+  const pkgPath = join(workspace, 'package.json');
+  if (!(await fileExists(pkgPath))) return;
+  let pkg;
+  try {
+    pkg = JSON.parse(await readFile(pkgPath, 'utf8'));
+  } catch {
+    return;
+  }
+  const hasDeps = Boolean(
+    (pkg.dependencies && Object.keys(pkg.dependencies).length > 0)
+    || (pkg.devDependencies && Object.keys(pkg.devDependencies).length > 0),
+  );
+  if (!hasDeps) return;
+
+  const hasLockfile = await fileExists(join(workspace, 'package-lock.json'));
+  if (!hasLockfile) {
+    run.memory.preflight.installStatus = 'failed';
+    throw new Error('No se encontró package-lock.json en el proyecto; no se ejecutará npm install automáticamente.');
+  }
+
+  const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const ciArgs = mode === 'approved-scripts' ? ['ci'] : ['ci', '--ignore-scripts'];
+  await logEvent('step.started', `Preparando entorno (npm ${ciArgs.join(' ')})`, { step: 'preflight', agent: 'local-preflight', dependencyInstallMode: mode });
+  const res = await runner({
+    command: npmCmd,
+    args: ciArgs,
+    cwd: workspace,
+    timeoutMs: 120000,
+    signal,
+  });
+  if (res.cancelled || signal?.aborted) throw new Error('Cancelado');
+  if (res.code !== 0 || res.error) {
+    run.memory.preflight.installStatus = 'failed';
+    const detail = sanitizeOutput(res.stdout, res.stderr, 800) || res.error || `Exit ${res.code}`;
+    run.memory.verificationOutput = detail;
+    await logEvent('step.failed', `Error preparando entorno: ${detail}`, { step: 'preflight', agent: 'local-preflight' });
+    throw new Error(`Error preparando entorno (npm ${ciArgs.join(' ')}): ${detail}`);
+  }
+  run.memory.preflight.installStatus = 'ok';
+  await logEvent('step.completed', 'Entorno preparado en copia temporal', { step: 'preflight', agent: 'local-preflight', ok: true, dependencyInstallMode: mode });
+
+  // Strict baseline verification before calling any AI agent
+  await verifyAcceptanceManifest(workspace, run.acceptanceManifest);
+  await logEvent('step.started', `Verificando base (npm run ${run.acceptanceManifest.scriptName})`, { step: 'baseline', agent: 'local-verifier' });
+  const acceptanceOptions = {
+    command: npmCmd,
+    args: ['run', run.acceptanceManifest.scriptName],
+    cwd: workspace,
+    timeoutMs: 60000,
+    signal,
+  };
+  let baseRes = await runner(acceptanceOptions);
+  if (isTransientVitestIpcFailure(baseRes) && isVitestAcceptance(run.acceptanceManifest)) {
+    await logEvent('step.retrying', 'Reintentando prueba base con pool threads por fallo de IPC de Vitest', {
+      step: 'baseline',
+      agent: 'local-verifier',
+      reason: 'vitest-ipc-threads-fallback',
+    });
+    await verifyAcceptanceManifest(workspace, run.acceptanceManifest);
+    baseRes = await runner({
+      ...acceptanceOptions,
+      args: [...acceptanceOptions.args, '--', '--pool=threads', '--maxWorkers=1'],
+    });
+  }
+  if (baseRes.cancelled || signal?.aborted) throw new Error('Cancelado');
+  if (baseRes.code !== 0 || baseRes.error) {
+    run.memory.preflight.baselineStatus = 'failed';
+    const detail = sanitizeOutput(baseRes.stdout, baseRes.stderr, 1500) || baseRes.error || `Exit ${baseRes.code}`;
+    run.memory.verificationOutput = detail;
+    await logEvent('step.failed', 'Prueba base fallida antes de cambios', { step: 'baseline', agent: 'local-verifier', code: baseRes.code, output: detail });
+    const err = new Error('El proyecto/copia no pasa sus pruebas antes de cambios.');
+    err.runStatus = 'baseline_failed';
+    throw err;
+  }
+  run.memory.preflight.baselineStatus = 'passed';
+  await logEvent('step.completed', 'Verificación base aprobada', { step: 'baseline', agent: 'local-verifier', ok: true });
+}
+
 export async function startRun(
   run,
   root,
@@ -119,6 +237,7 @@ export async function startRun(
     antigravityValidated = false,
     runner = runProcess,
     projectsRoot,
+    enforceBudget = false,
   } = {},
 ) {
   if (run.status !== 'pending') throw new Error('Ejecución ya iniciada');
@@ -157,6 +276,8 @@ export async function startRun(
     if (run.source.type === 'local-project') {
       await mkdir(dir, { recursive: true });
       await copyLocalProject({ projectsRoot, ...run.source, destination: workspace });
+      run.acceptanceManifest = await captureAcceptanceManifest(workspace, run.source.acceptanceScript);
+      await runDependencyPreflight({ run, workspace, runner, signal: run.controller.signal, logEvent });
     } else {
       await mkdir(workspace, { recursive: true });
     }
@@ -176,11 +297,13 @@ export async function startRun(
     if (run.mode === 'demo') {
       await runDemoFlow({ run, workspace, runner, logEvent, recordStep, recordDelegation, assertNotCancelled });
     } else {
-      await runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe });
+      await runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget });
     }
   } catch (error) {
     const cancelled = run.controller.signal.aborted && !executionTimedOut;
-    run.status = cancelled ? 'cancelled' : 'failed';
+    run.status = cancelled
+      ? 'cancelled'
+      : (error.runStatus === 'baseline_failed' || error.runStatus === 'acceptance_manifest_changed' ? error.runStatus : 'failed');
     const message = executionTimedOut ? 'Ejecución detenida: límite total de 15 minutos alcanzado.' : String(error.message);
     run.memory.problems.push(message);
     try {
@@ -239,7 +362,7 @@ async function runDemoFlow({ run, workspace, runner, logEvent, recordStep, recor
   run.status = result.code === 0 ? 'completed' : 'failed';
 }
 
-async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe }) {
+async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget = false }) {
   if (run.source.type === 'template') {
     await writeFile(join(workspace, 'package.json'), '{"type":"module"}\n');
     await writeFile(join(workspace, 'password.test.js'), testSource);
@@ -254,13 +377,39 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   const implPrompt = buildPrompt('implement', buildBoundedContext(run.memory, initialStatus.files), implRules);
   await recordDelegation('implement', { status: 'activo' });
   await logEvent('step.started', 'Iniciando implementación (Codex workspace-write)', { step: 'implement', agent: 'codex-implement' });
-  const impl = await codex.run(implPrompt, { workspace, sandbox: 'workspace-write', timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
+  let codexFailedInRun = false;
+  let implAgent = 'codex-implement';
+  let impl = await codex.run(implPrompt, { workspace, sandbox: 'workspace-write', timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
   recordProviderUsage(run.usage, 'codex', impl.usage?.totalTokens ?? null);
+
+  if (!impl.ok && antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available) {
+    codexFailedInRun = true;
+    const reason = impl.timedOut ? 'Codex agotó tiempo de espera' : 'Codex falló o sin crédito';
+    await logEvent('log', `${reason}; cambiando automáticamente a Antigravity (accept-edits --sandbox)`, { fallback: true, reason });
+    implAgent = 'antigravity-implement';
+    await recordDelegation('implement', {
+      provider: 'Antigravity',
+      agent: implAgent,
+      permission: 'accept-edits',
+      fallbackReason: `${reason}; fallback automático a Antigravity.`,
+      status: 'activo',
+    });
+    const agyImpl = await antigravity.run(implPrompt, {
+      workspace,
+      mode: 'accept-edits',
+      effort: 'low',
+      timeoutMs: AGENT_STEP_TIMEOUT_MS,
+      signal: run.controller.signal,
+    });
+    recordProviderUsage(run.usage, 'antigravity', agyImpl.usage?.totalTokens ?? null);
+    impl = { ...agyImpl, output: agyImpl.untrustedResponse || agyImpl.error || '' };
+  }
+
   await recordDelegation('implement', { status: impl.ok ? 'completado' : 'fallido', ms: impl.ms ?? 0, result: impl.ok ? 'ok' : (impl.error || 'fallido') });
   if (!impl.ok) {
     const failure = buildAgentFailure('Implementación', impl);
-    await recordStep('codex-implement', 'failed', failure.message, impl.ms ?? 0);
-    await logEvent('step.failed', failure.message, { step: 'implement', agent: 'codex-implement', ...failure.evidence });
+    await recordStep(implAgent, 'failed', failure.message, impl.ms ?? 0);
+    await logEvent('step.failed', failure.message, { step: 'implement', agent: implAgent, ...failure.evidence });
     throw new Error(failure.message);
   }
   await assertWorkspaceSafe();
@@ -287,16 +436,18 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
     antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available,
   );
   await recordDelegation('review', {
-    provider: useAntigravity ? 'Antigravity' : 'Codex (fallback)',
+    provider: useAntigravity ? 'Antigravity' : 'Codex',
     agent: useAntigravity ? 'antigravity-review' : 'codex-review',
-    reason: useAntigravity ? 'Revisión independiente de cambios.' : 'Revisión en modo solo lectura por fallback.',
+    reason: useAntigravity ? 'Revisión independiente de cambios.' : 'Revisión en modo solo lectura.',
+    fallbackReason: useAntigravity ? null : 'Antigravity no disponible; fallback a Codex en solo lectura.',
     status: 'activo',
   });
   let reviewerAgent = 'codex-review';
   let review;
   if (useAntigravity) {
     if (isBudgetExceeded(run.usage, 'antigravity')) {
-      throw new Error('Presupuesto local alcanzado para Antigravity; ejecución detenida');
+      if (enforceBudget) throw new Error('Presupuesto local alcanzado para Antigravity; ejecución detenida');
+      await logEvent('usage.warning', 'Uso observado elevado para Antigravity (modo informativo)');
     }
     reviewerAgent = 'antigravity-review';
     await logEvent('step.started', 'Iniciando revisión (Antigravity plan+sandbox)', { step: 'review', agent: reviewerAgent });
@@ -306,7 +457,8 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
     review = { ...agyRes, output: agyRes.untrustedResponse || agyRes.error || '' };
   } else {
     if (isBudgetExceeded(run.usage, 'codex')) {
-      throw new Error('Presupuesto local alcanzado para Codex; revisión detenida');
+      if (enforceBudget) throw new Error('Presupuesto local alcanzado para Codex; revisión detenida');
+      await logEvent('usage.warning', 'Uso observado elevado para Codex (modo informativo); continuando con revisión');
     }
     const reason = antigravityValidated ? 'Antigravity no disponible' : 'Antigravity no validado';
     await logEvent('step.started', 'Iniciando revisión (Codex read-only)', { step: 'review', agent: reviewerAgent, fallback: true });
@@ -347,20 +499,65 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   // Step 4: Single fix retry (workspace-write) + lack-of-progress check
   assertNotCancelled();
   if (isBudgetExceeded(run.usage, 'codex')) {
-    throw new Error('Presupuesto local alcanzado para Codex; corrección omitida');
+    if (enforceBudget) throw new Error('Presupuesto local alcanzado para Codex; corrección omitida');
+    await logEvent('usage.warning', 'Uso observado elevado para Codex (modo informativo); continuando con corrección única');
   }
   const beforeFix = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   const fixRules = buildSkillRulesForRole(run.memory.skills, 'fix', { goal: run.goal });
   const fixPrompt = buildPrompt('fix', buildBoundedContext(run.memory, beforeFix.files), fixRules);
-  await recordDelegation('fix', { status: 'activo' });
-  await logEvent('step.started', 'Iniciando corrección única (Codex workspace-write)', { step: 'fix', agent: 'codex-fix' });
-  const fix = await codex.run(fixPrompt, { workspace, sandbox: 'workspace-write', timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
-  recordProviderUsage(run.usage, 'codex', fix.usage?.totalTokens ?? null);
+  let fixAgent = 'codex-fix';
+  let fix;
+  if (codexFailedInRun && antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available) {
+    fixAgent = 'antigravity-fix';
+    await recordDelegation('fix', {
+      provider: 'Antigravity',
+      agent: fixAgent,
+      permission: 'accept-edits',
+      fallbackReason: 'Codex falló en esta ejecución; usando Antigravity directamente para corrección.',
+      status: 'activo',
+    });
+    await logEvent('step.started', 'Iniciando corrección única (Antigravity accept-edits)', { step: 'fix', agent: fixAgent });
+    const agyFix = await antigravity.run(fixPrompt, {
+      workspace,
+      mode: 'accept-edits',
+      effort: 'low',
+      timeoutMs: AGENT_STEP_TIMEOUT_MS,
+      signal: run.controller.signal,
+    });
+    recordProviderUsage(run.usage, 'antigravity', agyFix.usage?.totalTokens ?? null);
+    fix = { ...agyFix, output: agyFix.untrustedResponse || agyFix.error || '' };
+  } else {
+    await recordDelegation('fix', { status: 'activo' });
+    await logEvent('step.started', 'Iniciando corrección única (Codex workspace-write)', { step: 'fix', agent: 'codex-fix' });
+    fix = await codex.run(fixPrompt, { workspace, sandbox: 'workspace-write', timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
+    recordProviderUsage(run.usage, 'codex', fix.usage?.totalTokens ?? null);
+    if (!fix.ok && antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available) {
+      const reason = fix.timedOut ? 'Codex agotó tiempo de espera' : 'Codex falló o sin crédito';
+      await logEvent('log', `${reason}; cambiando automáticamente a Antigravity para corrección`, { fallback: true, reason });
+      fixAgent = 'antigravity-fix';
+      await recordDelegation('fix', {
+        provider: 'Antigravity',
+        agent: fixAgent,
+        permission: 'accept-edits',
+        fallbackReason: `${reason}; fallback automático a Antigravity.`,
+        status: 'activo',
+      });
+      const agyFix = await antigravity.run(fixPrompt, {
+        workspace,
+        mode: 'accept-edits',
+        effort: 'low',
+        timeoutMs: AGENT_STEP_TIMEOUT_MS,
+        signal: run.controller.signal,
+      });
+      recordProviderUsage(run.usage, 'antigravity', agyFix.usage?.totalTokens ?? null);
+      fix = { ...agyFix, output: agyFix.untrustedResponse || agyFix.error || '' };
+    }
+  }
   await recordDelegation('fix', { status: fix.ok ? 'completado' : 'fallido', ms: fix.ms ?? 0, result: fix.ok ? 'ok' : (fix.error || 'fallido') });
   if (!fix.ok) {
     const failure = buildAgentFailure('Corrección', fix);
-    await recordStep('codex-fix', 'failed', failure.message, fix.ms ?? 0);
-    await logEvent('step.failed', failure.message, { step: 'fix', agent: 'codex-fix', ...failure.evidence });
+    await recordStep(fixAgent, 'failed', failure.message, fix.ms ?? 0);
+    await logEvent('step.failed', failure.message, { step: 'fix', agent: fixAgent, ...failure.evidence });
     throw new Error(failure.message);
   }
   await assertWorkspaceSafe();
@@ -399,8 +596,12 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
 }
 
 async function runAcceptanceVerify({ run, workspace, runner, logEvent, recordStep }) {
+  if (run.source.type === 'local-project') {
+    await verifyAcceptanceManifest(workspace, run.acceptanceManifest);
+  }
+  const scriptName = run.source.type === 'local-project' ? run.acceptanceManifest.scriptName : null;
   const acceptance = run.source.type === 'local-project'
-    ? { command: process.platform === 'win32' ? 'npm.cmd' : 'npm', args: ['run', run.source.acceptanceScript], label: `npm run ${run.source.acceptanceScript}` }
+    ? { command: process.platform === 'win32' ? 'npm.cmd' : 'npm', args: ['run', scriptName], label: `npm run ${scriptName}` }
     : { command: process.execPath, args: ['--test', 'password.test.js'], label: ACCEPTANCE_COMMAND };
   await logEvent('verify', `Ejecutando verificación fija: ${acceptance.label}`, {
     projectPath: run.source.projectPath ?? null,
@@ -410,12 +611,18 @@ async function runAcceptanceVerify({ run, workspace, runner, logEvent, recordSte
     command: acceptance.command,
     args: acceptance.args,
     cwd: workspace,
-    timeoutMs: 10000,
+    timeoutMs: run.source.type === 'local-project' ? 60000 : 10000,
     signal: run.controller.signal,
   });
   if (result.cancelled || run.controller.signal.aborted) throw new Error('Cancelado');
   const status = await getGitStatus(workspace, { runner, signal: run.controller.signal });
-  await recordStep('local-verifier', result.code === 0 ? 'ok' : 'failed', `Exit ${result.code}; ${result.stdout.slice(-600)}`, result.ms, status.files);
-  await logEvent('verification.completed', result.code === 0 ? 'Prueba de aceptación aprobada' : 'Prueba de aceptación fallida', { code: result.code, passed: result.code === 0 });
+  const cleanOutput = sanitizeOutput(result.stdout, result.stderr, 1500);
+  run.memory.verificationOutput = result.code === 0 ? undefined : cleanOutput;
+  await recordStep('local-verifier', result.code === 0 ? 'ok' : 'failed', `Exit ${result.code}; ${cleanOutput.slice(-600)}`, result.ms, status.files);
+  await logEvent('verification.completed', result.code === 0 ? 'Prueba de aceptación aprobada' : 'Prueba de aceptación fallida', {
+    code: result.code,
+    passed: result.code === 0,
+    ...(result.code !== 0 && cleanOutput ? { output: cleanOutput } : {}),
+  });
   return result;
 }
