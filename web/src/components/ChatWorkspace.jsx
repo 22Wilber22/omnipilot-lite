@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   IconCheck, IconDownload, IconFile, IconLogo, IconPlay, IconStop,
 } from './Icons.jsx';
@@ -6,22 +6,11 @@ import { ChatMessage, StatusBadge } from './UiPrimitives.jsx';
 import TooltipInfo from './TooltipInfo.jsx';
 import ChatComposer from './ChatComposer.jsx';
 import OddDelegationCard from './OddDelegationCard.jsx';
-import ProjectSelector from './ProjectSelector.jsx';
 
 function formatDuration(startedAt, completedAt) {
   if (!startedAt || !completedAt) return '—';
   const ms = Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime());
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
-}
-
-function downloadJson(filename, data) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
 }
 
 function buildActivityMessages(events) {
@@ -50,12 +39,13 @@ function buildActivityMessages(events) {
 export default function ChatWorkspace({
   connected, diagnostics, mode,
   composerText, setComposerText,
-  messages, run, events, skills,
-  onSendMessage, onConvertToTask, onApprove, onCancel, onNewTask, onOpenSettings,
+  messages, pendingAction, run, events, skills,
+  onSendMessage, onConvertToTask, onResolvePendingAction, onRetryMessage, onApprove, onCancel, onNewTask, onDownloadEvidence, onDownloadPatch, onOpenSettings,
   projectConfig, showProjectPicker, onToggleProjectPicker,
   sending, busy, error,
 }) {
   const endRef = useRef(null);
+  const [dismissedRetries, setDismissedRetries] = useState(() => new Set());
   const agyAvailable = Boolean(diagnostics?.antigravity?.available);
   const isPending = run?.status === 'pending';
   const isRunning = run?.status === 'running';
@@ -145,17 +135,49 @@ export default function ChatWorkspace({
             {m.role !== 'user' && <span className="bubble-avatar"><IconLogo size={16} /></span>}
             <div className={m.role === 'user' ? 'bubble user' : 'bubble assistant'}>
               <p>{m.text}</p>
-              {m.type === 'needs-project' && (
+              {(m.type === 'needs-project' || m.actions?.includes('select-project')) && (
                 <div className="inline-actions">
                   <button type="button" className="primary sm" onClick={onToggleProjectPicker} disabled={busy}>
                     Seleccionar proyecto
                   </button>
                 </div>
               )}
-              {m.type === 'plan-conceptual' && !run && (
+              {(m.type === 'plan-conceptual' || m.actions?.includes('convert-to-task')) && !run && (
                 <div className="inline-actions">
                   <button type="button" className="primary sm" onClick={() => onConvertToTask(m.text)} disabled={busy}>
                     Convertir en tarea
+                  </button>
+                </div>
+              )}
+              {m.actions?.includes('prepare-plan') && pendingAction?.sourceMessageId !== m.id && (
+                <div className="inline-actions">
+                  <button type="button" className="primary sm" onClick={() => onResolvePendingAction?.('prepare-plan')} disabled={sending || busy}>
+                    Preparar plan
+                  </button>
+                </div>
+              )}
+              {pendingAction?.sourceMessageId === m.id && (
+                <div className="inline-actions">
+                  <button type="button" className="primary sm" onClick={() => onResolvePendingAction?.('prepare-plan')} disabled={sending || busy}>
+                    Preparar plan
+                  </button>
+                  <button type="button" className="secondary sm" onClick={() => onResolvePendingAction?.('choose-project')} disabled={sending || busy}>
+                    Trabajar en código
+                  </button>
+                </div>
+              )}
+              {m.type === 'chat-error' && m.retryable && !m.retried && !dismissedRetries.has(m.id) && (
+                <div className="inline-actions">
+                  <button type="button" className="primary sm" onClick={() => onRetryMessage?.(m.id)} disabled={sending || busy}>
+                    Reintentar
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary sm"
+                    onClick={() => setDismissedRetries(prev => new Set(prev).add(m.id))}
+                    disabled={sending}
+                  >
+                    Seguir conversando
                   </button>
                 </div>
               )}
@@ -269,14 +291,25 @@ export default function ChatWorkspace({
               </dl>
               <p className="copy-note">OmniPilot trabajó sobre una copia temporal. El proyecto original no se modificó.</p>
               <div className="delivery-actions">
-                <button type="button" className="secondary sm" onClick={() => downloadJson('ficha-evidencia.json', evidencePayload)}>
+                <button
+                  type="button"
+                  className="secondary sm"
+                  onClick={() => onDownloadEvidence?.(run.id)}
+                  disabled={!run?.id}
+                >
                   <IconDownload /> Ficha de evidencia
                 </button>
-                <button type="button" className="secondary sm" disabled title="Endpoint de parche (.diff) pendiente en servidor">
+                <button
+                  type="button"
+                  className="secondary sm"
+                  onClick={() => onDownloadPatch?.(run.id)}
+                  disabled={!run?.id || modifiedFiles.length === 0}
+                  title={modifiedFiles.length > 0 ? 'Descargar parche Git (.diff)' : 'No hay archivos modificados en esta ejecución'}
+                >
                   <IconDownload /> Parche (.diff)
                 </button>
-                <button type="button" className="secondary sm" disabled title="Endpoint de descarga de workspace pendiente en servidor">
-                  <IconDownload /> Workspace
+                <button type="button" className="secondary sm" disabled title="Exportación completa próximamente">
+                  <IconDownload /> Workspace · Exportación completa próximamente
                 </button>
               </div>
               <p className="muted">Los archivos nunca se descargan automáticamente.</p>
@@ -302,7 +335,21 @@ export default function ChatWorkspace({
 
       {error && <p className="error" role="alert">{error}</p>}
 
-      <ProjectSelector {...projectConfig} disabled={!connected || isRunning || Boolean(run && !isTerminal)} />
+      <div className="project-chip-bar">
+        <button
+          type="button"
+          className="project-chip-btn"
+          onClick={onToggleProjectPicker}
+          disabled={!connected || isRunning}
+          title={isRunning ? 'Proyecto bloqueado durante ejecución activa' : 'Cambiar proyecto de trabajo'}
+        >
+          {projectConfig.savedConfig
+            ? `Proyecto: ${projectConfig.savedConfig.sourceType === 'local-project'
+              ? `${projectConfig.savedConfig.projectName || projectConfig.savedConfig.projectPath} · ${projectConfig.savedConfig.acceptanceScript}`
+              : 'Plantilla de demostración · test'}`
+            : 'Elegir proyecto'}
+        </button>
+      </div>
 
       <ChatComposer
         value={composerText}

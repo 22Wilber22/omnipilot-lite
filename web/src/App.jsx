@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { apiRequest, streamRunEvents } from './apiClient.js';
 import { IconLogo, IconSettings } from './components/Icons.jsx';
 import Sidebar from './components/Sidebar.jsx';
-import HistoryList from './components/HistoryList.jsx';
+import ChatsDrawer from './components/ChatsDrawer.jsx';
 import ActiveTeamPanel from './components/ActiveTeamPanel.jsx';
 import ChatWorkspace from './components/ChatWorkspace.jsx';
 import SettingsDrawer from './components/SettingsDrawer.jsx';
@@ -23,7 +23,9 @@ const INITIAL_SKILLS = [
 
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [chatsOpen, setChatsOpen] = useState(false);
   const [mobilePanel, setMobilePanel] = useState(null);
+  const chatsBtnRef = useRef(null);
   const [token, setToken] = useState('');
   const [mode, setMode] = useState('codex');
   const [composerText, setComposerText] = useState('');
@@ -42,6 +44,7 @@ export default function App() {
   const [conversations, setConversations] = useState([]);
   const [activeConvId, setActiveConvId] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [pendingAction, setPendingAction] = useState(null);
   const [run, setRun] = useState(null);
   const [events, setEvents] = useState([]);
   const [sending, setSending] = useState(false);
@@ -220,6 +223,44 @@ export default function App() {
     });
   }
 
+  async function handleResolvePendingAction(action) {
+    if (!activeConvId) return;
+    try {
+      setSending(true);
+      setError('');
+      const label = action === 'prepare-plan' ? 'Preparar plan' : 'Trabajar en código';
+      const res = await apiRequest(token, `/api/conversations/${activeConvId}/messages`, {
+        method: 'POST',
+        body: { text: label, intent: 'chat', resolveAction: action },
+      });
+      setMessages(res.conversation.messages ?? []);
+      setPendingAction(res.conversation.pendingAction ?? null);
+      await refreshConversationList();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function handleRetryMessage(messageId) {
+    if (!activeConvId || !messageId) return;
+    try {
+      setSending(true);
+      setError('');
+      const res = await apiRequest(token, `/api/conversations/${activeConvId}/messages/${encodeURIComponent(messageId)}/retry`, {
+        method: 'POST',
+        body: { orchestratorProvider: roles.plan === 'codex' ? 'codex' : 'antigravity' },
+      });
+      setMessages(res.conversation.messages ?? []);
+      setPendingAction(res.conversation.pendingAction ?? null);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
   async function handleNewTask() {
     if (!diagnostics) return;
     try {
@@ -235,6 +276,7 @@ export default function App() {
       });
       setActiveConvId(conv.id);
       setMessages([]);
+      setPendingAction(null);
       setRun(null);
       setEvents([]);
       setDetachedRun(false);
@@ -278,6 +320,7 @@ export default function App() {
       });
       setComposerText('');
       setMessages(res.conversation.messages ?? []);
+      setPendingAction(res.conversation.pendingAction ?? null);
       if (res.run) {
         setRun(res.run);
         setEvents(res.run.events ?? []);
@@ -390,6 +433,32 @@ export default function App() {
     }
   }
 
+  async function downloadRunArtifact(path, fallbackFilename) {
+    if (!token) return;
+    setError('');
+    try {
+      const res = await fetch(path, { headers: { 'X-Omni-Token': token } });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `No se pudo descargar (${res.status})`);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get('Content-Disposition') || '';
+      const match = cd.match(/filename="([^"]+)"/);
+      const filename = match ? match[1] : fallbackFilename;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e.message || 'No se pudo descargar el archivo');
+    }
+  }
+
   async function cancelActiveRun() {
     if (!run || run.status !== 'running') return;
     try {
@@ -406,6 +475,12 @@ export default function App() {
   const lastStarted = [...events].reverse().find(e => e.type === 'step.started');
   const activeAgent = run?.status === 'running' ? (lastStarted?.agent ?? '') : '';
 
+  useEffect(() => {
+    const locked = chatsOpen || settingsOpen || showProjectPicker;
+    document.body.style.overflow = locked ? 'hidden' : '';
+    return () => { document.body.style.overflow = ''; };
+  }, [chatsOpen, settingsOpen, showProjectPicker]);
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -416,10 +491,12 @@ export default function App() {
         <div className="topbar-right">
           {diagnostics && <span className="status-pill">Conectado localmente</span>}
           <button
+            ref={chatsBtnRef}
             type="button"
-            className="secondary sm mobile-only"
-            onClick={() => setMobilePanel(p => (p === 'left' ? null : 'left'))}
-            aria-expanded={mobilePanel === 'left'}
+            className="secondary sm"
+            onClick={() => setChatsOpen(v => !v)}
+            aria-expanded={chatsOpen}
+            aria-controls="chats-drawer"
             aria-label="Mostrar u ocultar historial de chats"
           >
             Chats
@@ -445,28 +522,6 @@ export default function App() {
       </header>
 
       <div className={`shell-grid${mobilePanel ? ` show-${mobilePanel}` : ''}`}>
-        <Sidebar title="Chats" side="left">
-          <HistoryList
-            items={conversations}
-            activeId={activeConvId}
-            connected={Boolean(diagnostics)}
-            onNewTask={handleNewTask}
-            onSelect={id => {
-              setMobilePanel(null);
-              openConversation(id).catch(e => setError(e.message));
-            }}
-            busy={busy}
-          />
-          <button
-            type="button"
-            className="secondary full sidebar-settings-btn"
-            onClick={() => setSettingsOpen(true)}
-            aria-label="Abrir ajustes desde la barra lateral"
-          >
-            <IconSettings /> Ajustes
-          </button>
-        </Sidebar>
-
         <ChatWorkspace
           connected={Boolean(diagnostics)}
           diagnostics={diagnostics}
@@ -474,14 +529,19 @@ export default function App() {
           composerText={composerText}
           setComposerText={setComposerText}
           messages={messages}
+          pendingAction={pendingAction}
           run={run}
           events={events}
           skills={skills}
           onSendMessage={handleSendMessage}
           onConvertToTask={handleConvertToTask}
+          onResolvePendingAction={handleResolvePendingAction}
+          onRetryMessage={handleRetryMessage}
           onApprove={approveRun}
           onCancel={cancelActiveRun}
           onNewTask={handleNewTask}
+          onDownloadEvidence={runId => downloadRunArtifact(`/api/runs/${encodeURIComponent(runId)}/evidence`, `omnipilot-evidence-${runId}.json`)}
+          onDownloadPatch={runId => downloadRunArtifact(`/api/runs/${encodeURIComponent(runId)}/patch`, `omnipilot-changes-${runId}.diff`)}
           onOpenSettings={() => setSettingsOpen(true)}
           showProjectPicker={showProjectPicker}
           onToggleProjectPicker={() => setShowProjectPicker(v => !v)}
@@ -516,6 +576,19 @@ export default function App() {
           />
         </Sidebar>
       </div>
+
+      <ChatsDrawer
+        open={chatsOpen}
+        onClose={() => setChatsOpen(false)}
+        returnFocusRef={chatsBtnRef}
+        items={conversations}
+        activeId={activeConvId}
+        connected={Boolean(diagnostics)}
+        onNewTask={handleNewTask}
+        onSelect={id => openConversation(id).catch(e => setError(e.message))}
+        onOpenSettings={() => setSettingsOpen(true)}
+        busy={busy}
+      />
 
       <SettingsDrawer
         open={settingsOpen}

@@ -8,10 +8,21 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const messageSchema = z.object({
   id: z.string(),
   role: z.enum(['user', 'orchestrator', 'system']),
-  type: z.enum(['chat', 'plan-conceptual', 'needs-project', 'tarea', 'actividad']).optional().default('chat'),
+  type: z.enum(['chat', 'chat-error', 'plan-conceptual', 'needs-project', 'tarea', 'actividad']).optional().default('chat'),
   text: z.string(),
   createdAt: z.string(),
   runId: z.string().optional(),
+  errorCause: z.enum(['timeout', 'provider-unavailable', 'empty-response']).optional(),
+  retryable: z.boolean().optional(),
+  retried: z.boolean().optional(),
+  retrySourceMessageId: z.string().optional(),
+  actions: z.array(z.enum(['prepare-plan', 'convert-to-task', 'select-project'])).optional(),
+});
+
+export const pendingActionSchema = z.object({
+  type: z.enum(['prepare-plan', 'choose-project', 'convert-to-task']),
+  sourceMessageId: z.string(),
+  createdAt: z.string(),
 });
 
 export const projectConfigSchema = z.object({
@@ -29,6 +40,7 @@ export const conversationSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   projectConfig: projectConfigSchema.nullable().default(null),
+  pendingAction: pendingActionSchema.nullable().default(null),
   messages: z.array(messageSchema),
   runIds: z.array(z.string()),
 });
@@ -133,7 +145,35 @@ export function createConversationStore(baseDir) {
       }
     },
 
-    async appendMessage(id, { role, type = 'chat', text, runId }) {
+    async setPendingAction(id, pendingAction) {
+      const conv = await this.get(id);
+      if (!conv) return null;
+      conv.pendingAction = pendingAction ? pendingActionSchema.parse(pendingAction) : null;
+      conv.updatedAt = new Date().toISOString();
+      await atomicWriteJson(convPath(conv.id), conv);
+      return conv;
+    },
+
+    async updateMessage(id, messageId, patch) {
+      const conv = await this.get(id);
+      if (!conv) return null;
+      const idx = conv.messages.findIndex(m => m.id === messageId);
+      if (idx === -1) return null;
+      conv.messages[idx] = messageSchema.parse({
+        ...conv.messages[idx],
+        ...patch,
+        id: conv.messages[idx].id,
+        createdAt: conv.messages[idx].createdAt,
+      });
+      conv.updatedAt = new Date().toISOString();
+      await atomicWriteJson(convPath(conv.id), conv);
+      return { conversation: conv, message: conv.messages[idx] };
+    },
+
+    async appendMessage(id, {
+      role, type = 'chat', text, runId,
+      errorCause, retryable, retried, retrySourceMessageId, actions,
+    }) {
       const conv = await this.get(id);
       if (!conv) return null;
       const now = new Date().toISOString();
@@ -144,6 +184,11 @@ export function createConversationStore(baseDir) {
         text: String(text).slice(0, 2000),
         createdAt: now,
         ...(runId ? { runId } : {}),
+        ...(errorCause ? { errorCause } : {}),
+        ...(retryable !== undefined ? { retryable } : {}),
+        ...(retried !== undefined ? { retried } : {}),
+        ...(retrySourceMessageId ? { retrySourceMessageId } : {}),
+        ...(Array.isArray(actions) && actions.length ? { actions } : {}),
       });
       conv.messages.push(msg);
       if (role === 'user' && conv.title === 'Nueva tarea') {

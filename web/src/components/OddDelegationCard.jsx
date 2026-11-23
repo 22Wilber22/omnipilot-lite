@@ -10,11 +10,12 @@ const STATUS_VARIANT = {
 };
 
 export default function OddDelegationCard({ delegation = [], isTerminal = false }) {
-  if (!delegation.length) return null;
+  const visible = delegation.filter(item => item && item.provider && item.provider !== '-');
+  if (!visible.length) return null;
 
   const content = (
     <ul className="odd-list">
-      {delegation.map(item => (
+      {visible.map(item => (
         <li key={item.phase} className={item.status === 'activo' ? 'odd-row active' : 'odd-row'}>
           <div className="between">
             <strong>{item.role}</strong>
@@ -22,9 +23,11 @@ export default function OddDelegationCard({ delegation = [], isTerminal = false 
           </div>
           <div className="odd-meta">
             <span>{item.provider}</span> · <span className="mono-inline">{item.permission}</span>
-            {item.model ? <> · <span>{item.model}</span></> : null}
+            {' · '}
+            <span>{item.model || 'Modelo predeterminado'}</span>
           </div>
           <p className="muted">Motivo: {item.reason}</p>
+          {item.fallbackReason && <p className="muted">Fallback: {item.fallbackReason}</p>}
         </li>
       ))}
     </ul>

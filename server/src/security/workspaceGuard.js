@@ -1,4 +1,4 @@
-import { lstat, realpath, readdir } from 'node:fs/promises';
+import { lstat, realpath, readdir, writeFile } from 'node:fs/promises';
 import { resolve, relative, isAbsolute, join, sep } from 'node:path';
 import { runProcess } from '../connectors/processRunner.js';
 
@@ -75,16 +75,29 @@ export async function resolveSafeWorkspacePath(root, ...segments) {
   return target;
 }
 
+const GIT_EXCLUDE_RULES = [
+  'node_modules/',
+  '**/node_modules/',
+  '.env',
+  '.env.*',
+  '*.pem',
+  '*.key',
+  '.DS_Store',
+].join('\n') + '\n';
+
+const IGNORED_STATUS_RE = /(?:^|\/)(?:node_modules|\.git|\.env(?:\.[^/]+)?)(?:\/|$)/i;
+
 export async function initGitWorkspace(workspaceDir, { runner = runProcess, signal } = {}) {
   const res = await runner({ command: 'git', args: ['init', '--quiet'], cwd: workspaceDir, timeoutMs: 10000, signal });
   if (res.cancelled) throw new Error('Cancelado');
   if (res.code !== 0 || res.error) throw new Error(`Error al inicializar Git: ${res.error || res.stderr.trim()}`);
+  await writeFile(resolve(workspaceDir, '.git', 'info', 'exclude'), GIT_EXCLUDE_RULES, 'utf8');
 }
 
 export async function commitBaseline(workspaceDir, { runner = runProcess, signal } = {}) {
   const add = await runner({
     command: 'git',
-    args: ['add', '-A', '--', '.', ':(exclude)node_modules'],
+    args: ['add', '-A'],
     cwd: workspaceDir,
     timeoutMs: 10000,
     signal,
@@ -98,7 +111,7 @@ export async function commitBaseline(workspaceDir, { runner = runProcess, signal
       '-c', 'user.name=OmniPilot Local',
       '-c', 'user.email=omnipilot@local.invalid',
       '-c', 'commit.gpgsign=false',
-      'commit', '-m', 'Baseline workspace', '--quiet',
+      'commit', '--allow-empty', '-m', 'Baseline workspace', '--quiet',
     ],
     cwd: workspaceDir,
     timeoutMs: 10000,
@@ -111,7 +124,7 @@ export async function commitBaseline(workspaceDir, { runner = runProcess, signal
 export async function captureGitPatch(workspaceDir, { runner = runProcess, signal } = {}) {
   const add = await runner({
     command: 'git',
-    args: ['add', '-A', '--', '.', ':(exclude)node_modules'],
+    args: ['add', '-A'],
     cwd: workspaceDir,
     timeoutMs: 10000,
     signal,
@@ -120,7 +133,10 @@ export async function captureGitPatch(workspaceDir, { runner = runProcess, signa
   if (add.code !== 0 || add.error) throw new Error(`Error al preparar parche: ${add.error || add.stderr.trim()}`);
   const diff = await runner({
     command: 'git',
-    args: ['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--', '.', ':(exclude)node_modules'],
+    args: [
+      'diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--',
+      '.', ':(exclude)node_modules', ':(exclude)**/node_modules', ':(exclude).env', ':(exclude).env.*',
+    ],
     cwd: workspaceDir,
     timeoutMs: 10000,
     signal,
@@ -133,7 +149,7 @@ export async function captureGitPatch(workspaceDir, { runner = runProcess, signa
 export async function getGitStatus(workspaceDir, { runner = runProcess, signal } = {}) {
   const res = await runner({
     command: 'git',
-    args: ['status', '--porcelain', '--untracked-files=all', '--', '.', ':(exclude)node_modules'],
+    args: ['status', '--porcelain', '--untracked-files=all'],
     cwd: workspaceDir,
     timeoutMs: 10000,
     signal,
@@ -143,6 +159,6 @@ export async function getGitStatus(workspaceDir, { runner = runProcess, signal }
   const lines = res.stdout.split(/\r?\n/).filter(Boolean).sort();
   const files = lines
     .map(line => line.slice(3).trim())
-    .filter(f => Boolean(f) && f !== 'node_modules' && !f.startsWith('node_modules/'));
+    .filter(f => Boolean(f) && !IGNORED_STATUS_RE.test(f));
   return { raw: lines.join('\n'), files };
 }

@@ -7,8 +7,15 @@ import { antigravityConnector } from '../connectors/antigravityConnector.js';
 import { createConversationStore } from '../memory/conversationStore.js';
 import { createSettingsStore } from '../memory/settingsStore.js';
 import { classifyMessage } from '../orchestrator/messageClassifier.js';
-import { runOrchestratorChat } from '../orchestrator/chatOrchestrator.js';
+import {
+  runOrchestratorChat,
+  offersPlanOrExecution,
+  resolvePendingActionIntent,
+  isDirectExecuteIntent,
+  buildConceptualPlanReply,
+} from '../orchestrator/chatOrchestrator.js';
 import { inspectLocalProject, validateLocalProjectSource } from '../projects/localProjects.js';
+import { buildEvidenceDocument, readSafePatch } from '../security/runArtifacts.js';
 
 export const DEFAULT_CONVERSATIONS_DIR = fileURLToPath(new URL('../../../data/conversations', import.meta.url));
 export const DEFAULT_SETTINGS_PATH = fileURLToPath(new URL('../../../data/settings.json', import.meta.url));
@@ -232,6 +239,99 @@ export function createApp({
     const { message: userMessage } = await conversations.appendMessage(conv.id, { role: 'user', type: 'chat', text });
 
     if (req.body?.intent === 'chat') {
+      const explicitAction = req.body?.resolveAction;
+      if (explicitAction === 'prepare-plan' || explicitAction === 'choose-project') {
+        const prevUser = [...conv.messages].reverse().find(m => m.role === 'user');
+        await conversations.setPendingAction(conv.id, null);
+        if (explicitAction === 'prepare-plan') {
+          const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+            role: 'orchestrator',
+            type: 'plan-conceptual',
+            text: buildConceptualPlanReply(prevUser?.text || ''),
+          });
+          return res.status(201).json({ conversation, userMessage, reply, run: null });
+        }
+        const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+          role: 'orchestrator',
+          type: 'needs-project',
+          text: 'Perfecto. Selecciona un proyecto y una prueba de aceptación para continuar.',
+        });
+        return res.status(201).json({ conversation, userMessage, reply, run: null });
+      }
+
+      if (conv.pendingAction) {
+        const resolved = resolvePendingActionIntent(text);
+        if (resolved === 'prepare-plan') {
+          const prevUser = [...conv.messages].reverse().find(m => m.role === 'user');
+          await conversations.setPendingAction(conv.id, null);
+          const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+            role: 'orchestrator',
+            type: 'plan-conceptual',
+            text: buildConceptualPlanReply(prevUser?.text || ''),
+          });
+          return res.status(201).json({ conversation, userMessage, reply, run: null });
+        }
+        if (resolved === 'choose-project') {
+          await conversations.setPendingAction(conv.id, null);
+          const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+            role: 'orchestrator',
+            type: 'needs-project',
+            text: 'Perfecto. Selecciona un proyecto y una prueba de aceptación para trabajar en código.',
+          });
+          return res.status(201).json({ conversation, userMessage, reply, run: null });
+        }
+        const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+          role: 'orchestrator',
+          type: 'chat',
+          text: 'No quedó claro: ¿prefieres que prepare el plan o trabajar en código?',
+        });
+        return res.status(201).json({ conversation, userMessage, reply, run: null });
+      }
+
+      const hasConceptualPlan = conv.messages.some(m => m.type === 'plan-conceptual');
+      if (isDirectExecuteIntent(text) && hasConceptualPlan) {
+        if (!conv.projectConfig) {
+          const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+            role: 'orchestrator',
+            type: 'needs-project',
+            text: 'Para continuar, selecciona un proyecto y una prueba de aceptación.',
+            actions: ['select-project'],
+          });
+          return res.status(201).json({ conversation, userMessage, reply, run: null });
+        }
+        let source = { type: 'template' };
+        let mode = 'demo';
+        if (conv.projectConfig.sourceType === 'local-project') {
+          try {
+            source = await validateLocalProjectSource({
+              projectsRoot,
+              projectPath: conv.projectConfig.projectPath,
+              acceptanceScript: conv.projectConfig.acceptanceScript,
+            });
+            mode = 'codex';
+          } catch (e) {
+            const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+              role: 'orchestrator',
+              type: 'needs-project',
+              text: `El proyecto guardado ya no es válido: ${e.message}. Selecciona otro proyecto.`,
+            });
+            return res.status(201).json({ conversation, userMessage, reply, run: null });
+          }
+        }
+        const lastPlan = [...conv.messages].reverse().find(m => m.type === 'plan-conceptual');
+        const goalText = lastPlan?.text || conv.title || text;
+        const run = createRun(goalText, mode, source, req.body?.budgets, req.body?.activeSkills);
+        runToConversation.set(run.id, conv.id);
+        await conversations.attachRun(conv.id, run.id, 'plan_pending');
+        const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+          role: 'orchestrator',
+          type: 'tarea',
+          text: 'Plan ejecutable listo. Revísalo y pulsa Aprobar y ejecutar.',
+          runId: run.id,
+        });
+        return res.status(201).json({ conversation, userMessage, reply, run: publicRun(run) });
+      }
+
       const saved = await settingsStore.get();
       const provider = req.body?.orchestratorProvider || saved.chatProvider || 'auto';
       const chatRes = await runOrchestratorChat({
@@ -245,11 +345,32 @@ export function createApp({
         antigravity,
         antigravityValidated,
       });
+      if (!chatRes.ok) {
+        const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+          role: 'orchestrator',
+          type: 'chat-error',
+          text: chatRes.text,
+          errorCause: chatRes.errorCause || 'provider-unavailable',
+          retryable: true,
+          retried: false,
+          retrySourceMessageId: userMessage.id,
+        });
+        return res.status(201).json({ conversation, userMessage, reply, run: null });
+      }
       const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
         role: 'orchestrator',
         type: chatRes.type,
         text: chatRes.text,
+        actions: chatRes.actions,
       });
+      if (offersPlanOrExecution(chatRes.text)) {
+        const updated = await conversations.setPendingAction(conv.id, {
+          type: 'prepare-plan',
+          sourceMessageId: reply.id,
+          createdAt: new Date().toISOString(),
+        });
+        return res.status(201).json({ conversation: updated, userMessage, reply, run: null });
+      }
       return res.status(201).json({ conversation, userMessage, reply, run: null });
     }
 
@@ -345,6 +466,61 @@ export function createApp({
     return res.status(201).json({ conversation, userMessage, reply, run: publicRun(run) });
   });
 
+  app.post('/api/conversations/:id/messages/:messageId/retry', async (req, res) => {
+    let conv;
+    try {
+      conv = await conversations.get(req.params.id);
+    } catch {
+      return res.status(400).json({ error: 'ID de conversación inválido' });
+    }
+    if (!conv) return res.sendStatus(404);
+
+    const errMsg = conv.messages.find(m => m.id === req.params.messageId && m.type === 'chat-error');
+    if (!errMsg) return res.status(404).json({ error: 'Mensaje de error no encontrado' });
+    if (errMsg.retried || !errMsg.retryable) {
+      return res.status(409).json({ error: 'Este mensaje ya fue reintentado una vez' });
+    }
+
+    const srcMsg = conv.messages.find(m => m.id === errMsg.retrySourceMessageId)
+      || [...conv.messages].reverse().find(m => m.role === 'user');
+    if (!srcMsg) return res.status(400).json({ error: 'Mensaje original no encontrado' });
+
+    const historyUpToSource = conv.messages.slice(0, conv.messages.findIndex(m => m.id === srcMsg.id) + 1);
+    const saved = await settingsStore.get();
+    const provider = req.body?.orchestratorProvider || saved.chatProvider || 'auto';
+    const chatRes = await runOrchestratorChat({
+      provider,
+      model: saved.chatModel,
+      style: saved.chatStyle,
+      messages: historyUpToSource,
+      text: srcMsg.text,
+      hasProject: Boolean(conv.projectConfig),
+      codex,
+      antigravity,
+      antigravityValidated,
+    });
+
+    if (!chatRes.ok) {
+      const updated = await conversations.updateMessage(conv.id, errMsg.id, {
+        type: 'chat-error',
+        text: 'El orquestador no está disponible ahora. Puedes continuar o intentarlo más tarde.',
+        errorCause: chatRes.errorCause || 'provider-unavailable',
+        retryable: false,
+        retried: true,
+      });
+      return res.json({ conversation: updated.conversation, reply: updated.message, run: null });
+    }
+
+    const updated = await conversations.updateMessage(conv.id, errMsg.id, {
+      type: chatRes.type,
+      text: chatRes.text,
+      errorCause: undefined,
+      retryable: false,
+      retried: true,
+    });
+    return res.json({ conversation: updated.conversation, reply: updated.message, run: null });
+  });
+
   app.post('/api/conversations/:id/convert-to-task', async (req, res) => {
     let conv;
     try {
@@ -415,6 +591,40 @@ export function createApp({
   app.get('/api/runs/:id', (req, res) => {
     const run = getRun(req.params.id);
     return run ? res.json(publicRun(run)) : res.sendStatus(404);
+  });
+
+  app.get('/api/runs/:id/evidence', async (req, res) => {
+    try {
+      const run = getRun(req.params.id) || null;
+      const evidence = await buildEvidenceDocument({
+        runId: req.params.id,
+        workspacesDir,
+        run,
+      });
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="omnipilot-evidence-${req.params.id}.json"`);
+      res.setHeader('Cache-Control', 'no-store');
+      return res.send(JSON.stringify(evidence, null, 2));
+    } catch (e) {
+      const status = e.statusCode || 500;
+      return res.status(status).json({ error: e.message || 'No se pudo generar la evidencia' });
+    }
+  });
+
+  app.get('/api/runs/:id/patch', async (req, res) => {
+    try {
+      const patch = await readSafePatch({
+        runId: req.params.id,
+        workspacesDir,
+      });
+      res.setHeader('Content-Type', 'text/x-diff; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="omnipilot-changes-${req.params.id}.diff"`);
+      res.setHeader('Cache-Control', 'no-store');
+      return res.send(patch);
+    } catch (e) {
+      const status = e.statusCode || 500;
+      return res.status(status).json({ error: e.message || 'No se pudo obtener el parche' });
+    }
   });
 
   app.post('/api/runs/:id/approve', async (req, res) => {

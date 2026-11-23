@@ -1,3 +1,5 @@
+import { routePhase } from './router.js';
+
 export const ODD_SKILL_ID = 'orchestrator-driven-development';
 
 export const SKILL_CATALOG = Object.freeze({
@@ -80,61 +82,18 @@ export function buildSkillRulesForRole(activeSkillIds, role, { goal = '' } = {})
 }
 
 export function buildOddDelegation({ antigravityAvailable = false, acceptanceLabel = 'node --test password.test.js' } = {}) {
+  const availability = { codex: true, antigravity: antigravityAvailable };
+  const plan = routePhase({ phase: 'plan', availability, acceptanceLabel });
+  const impl = routePhase({ phase: 'implement', availability, acceptanceLabel });
+  const review = routePhase({ phase: 'review', availability, acceptanceLabel });
+  const verify = routePhase({ phase: 'verify', availability, acceptanceLabel });
+  const fix = routePhase({ phase: 'fix', availability, acceptanceLabel });
+
   return [
-    {
-      phase: 'plan',
-      role: 'Planificación',
-      agent: 'local-orchestrator',
-      provider: 'OmniPilot',
-      permission: 'plan determinista local',
-      reason: 'Analiza alcance sin modificar archivos.',
-      status: 'completado',
-      ms: 0,
-      result: 'Plan determinista creado',
-    },
-    {
-      phase: 'implement',
-      role: 'Implementación',
-      agent: 'codex-implement',
-      provider: 'Codex',
-      permission: 'workspace-write',
-      reason: 'Tarea de código en copia temporal.',
-      status: 'pendiente',
-      ms: 0,
-      result: null,
-    },
-    {
-      phase: 'review',
-      role: 'Revisión',
-      agent: antigravityAvailable ? 'antigravity-review' : 'codex-review',
-      provider: antigravityAvailable ? 'Antigravity' : 'Codex (fallback)',
-      permission: 'solo lectura',
-      reason: antigravityAvailable ? 'Revisión independiente de cambios.' : 'Revisión en modo solo lectura por fallback.',
-      status: 'pendiente',
-      ms: 0,
-      result: null,
-    },
-    {
-      phase: 'verify',
-      role: 'Verificación',
-      agent: 'local-verifier',
-      provider: 'Node local',
-      permission: 'local',
-      reason: `Evidencia final fija (${acceptanceLabel}).`,
-      status: 'pendiente',
-      ms: 0,
-      result: null,
-    },
-    {
-      phase: 'fix',
-      role: 'Corrección',
-      agent: 'codex-fix',
-      provider: 'Codex',
-      permission: 'workspace-write',
-      reason: 'Una única corrección si falla la prueba local.',
-      status: 'pendiente',
-      ms: 0,
-      result: null,
-    },
+    { phase: 'plan', role: 'Planificación', ...plan, status: 'completado', ms: 0, result: 'Plan determinista creado' },
+    { phase: 'implement', role: 'Implementación', ...impl, status: 'pendiente', ms: 0, result: null },
+    { phase: 'review', role: 'Revisión', ...review, status: 'pendiente', ms: 0, result: null },
+    { phase: 'verify', role: 'Verificación', ...verify, status: 'pendiente', ms: 0, result: null },
+    { phase: 'fix', role: 'Corrección', ...fix, status: 'pendiente', ms: 0, result: null },
   ];
 }

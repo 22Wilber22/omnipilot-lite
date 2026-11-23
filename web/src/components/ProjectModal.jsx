@@ -20,7 +20,7 @@ export default function ProjectModal({
     || Boolean(projectConfig.project && projectConfig.acceptanceScript);
 
   return (
-    <div className="drawer-backdrop" onClick={onClose} role="presentation">
+    <div className="drawer-backdrop modal-top" onClick={onClose} role="presentation">
       <aside className="drawer-panel" role="dialog" aria-modal="true" aria-label="Seleccionar proyecto" onClick={e => e.stopPropagation()}>
         <div className="drawer-head">
           <div>

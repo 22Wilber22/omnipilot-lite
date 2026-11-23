@@ -35,6 +35,8 @@ const delegationPhaseSchema = z.object({
   provider: z.string(),
   permission: z.string(),
   reason: z.string(),
+  fallbackReason: z.string().nullable().optional().default(null),
+  model: z.string().nullable().optional().default(null),
   status: z.enum(['pendiente', 'activo', 'completado', 'fallido', 'omitido']).default('pendiente'),
   ms: z.number().default(0),
   result: z.string().nullable().default(null),

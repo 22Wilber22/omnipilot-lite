@@ -266,7 +266,11 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   await assertWorkspaceSafe();
   const afterImpl = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   if (afterImpl.files.some(isExcludedProjectPath)) throw new Error('Codex creó un archivo excluido o sensible');
-  await writeFile(join(dir, 'changes.patch'), await captureGitPatch(workspace, { runner, signal: run.controller.signal }), { mode: 0o600 });
+  try {
+    await writeFile(join(dir, 'changes.patch'), await captureGitPatch(workspace, { runner, signal: run.controller.signal }), { mode: 0o600 });
+  } catch (patchErr) {
+    await logEvent('artifact.unavailable', `Parche no disponible tras implementación: ${patchErr.message}`, { artifact: 'changes.patch' });
+  }
   if (afterImpl.raw !== initialStatus.raw) {
     await logEvent('files.changed', `Archivos modificados: ${afterImpl.files.join(', ')}`, { files: afterImpl.files });
   }
@@ -362,7 +366,11 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   await assertWorkspaceSafe();
   const afterFix = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   if (afterFix.files.some(isExcludedProjectPath)) throw new Error('Codex creó un archivo excluido o sensible');
-  await writeFile(join(dir, 'changes.patch'), await captureGitPatch(workspace, { runner, signal: run.controller.signal }), { mode: 0o600 });
+  try {
+    await writeFile(join(dir, 'changes.patch'), await captureGitPatch(workspace, { runner, signal: run.controller.signal }), { mode: 0o600 });
+  } catch (patchErr) {
+    await logEvent('artifact.unavailable', `Parche no disponible tras implementación: ${patchErr.message}`, { artifact: 'changes.patch' });
+  }
   if (afterFix.raw !== beforeFix.raw) {
     await logEvent('files.changed', `Archivos modificados en corrección: ${afterFix.files.join(', ')}`, { files: afterFix.files });
   }
