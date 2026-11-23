@@ -6,11 +6,14 @@ import HistoryList from './components/HistoryList.jsx';
 import ActiveTeamPanel from './components/ActiveTeamPanel.jsx';
 import ChatWorkspace from './components/ChatWorkspace.jsx';
 import SettingsDrawer from './components/SettingsDrawer.jsx';
+import ProjectModal from './components/ProjectModal.jsx';
 
 const TERMINAL_EVENTS = new Set(['run.completed', 'run.failed', 'run.cancelled']);
+const SESSION_TOKEN_KEY = 'omnipilot.sessionToken';
 const SAFE_PROJECT_PATH = /^[\p{L}\p{N}._/ -]*$/u;
 
 const INITIAL_SKILLS = [
+  { id: 'orchestrator-driven-development', name: 'ODD · Orchestrator-Driven Development', description: 'Planifica, delega, supervisa, verifica y deja evidencia.', status: 'active' },
   { id: 'clean-code', name: 'Código limpio', description: 'Cambios pequeños, nombres claros y sin complejidad extra.', status: 'active' },
   { id: 'focused-changes', name: 'Cambios enfocados', description: 'Limita las ediciones a los archivos necesarios de la tarea.', status: 'active' },
   { id: 'controlled-fix', name: 'Corrección controlada', description: 'Un único intento de corrección guiado por el error real.', status: 'installed' },
@@ -20,12 +23,14 @@ const INITIAL_SKILLS = [
 
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobilePanel, setMobilePanel] = useState(null);
   const [token, setToken] = useState('');
   const [mode, setMode] = useState('codex');
   const [composerText, setComposerText] = useState('');
   const [roles, setRoles] = useState({ plan: 'antigravity', implement: 'codex', review: 'antigravity', fix: 'codex' });
   const [skills, setSkills] = useState(INITIAL_SKILLS);
   const [usageLevels, setUsageLevels] = useState({ codex: 'Medio', antigravity: 'Bajo' });
+  const [budgets, setBudgets] = useState({ codex: 40000, antigravity: 20000 });
   const [diagnostics, setDiagnostics] = useState(null);
   const [sourceType, setSourceType] = useState('template');
   const [projectPath, setProjectPath] = useState('');
@@ -40,12 +45,24 @@ export default function App() {
   const [run, setRun] = useState(null);
   const [events, setEvents] = useState([]);
   const [sending, setSending] = useState(false);
+  const [showProjectPicker, setShowProjectPicker] = useState(false);
+  const [targetScope, setTargetScope] = useState('');
+  const [savedProjectConfig, setSavedProjectConfig] = useState(null);
+  const [chatSettings, setChatSettings] = useState({ chatProvider: 'auto', chatModel: null, chatStyle: 'fast' });
+  const [availableModels, setAvailableModels] = useState({ antigravity: [] });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [detachedRun, setDetachedRun] = useState(false);
   const streamAbortRef = useRef(null);
 
   useEffect(() => () => streamAbortRef.current?.abort(), []);
+
+  useEffect(() => {
+    const stored = window.sessionStorage.getItem(SESSION_TOKEN_KEY);
+    if (!stored) return;
+    setToken(stored);
+    checkConnection(stored, true);
+  }, []);
   useEffect(() => {
     if (sourceType === 'local-project' && mode !== 'codex') setMode('codex');
   }, [sourceType, mode]);
@@ -59,12 +76,41 @@ export default function App() {
     return list;
   }
 
+  function applyProjectConfig(cfg) {
+    if (!cfg) return;
+    setSourceType(cfg.sourceType);
+    if (cfg.sourceType === 'local-project') {
+      setProjectPath(cfg.projectPath || '');
+      setAcceptanceScript(cfg.acceptanceScript || '');
+      setInspectedProject({
+        name: cfg.projectName || cfg.projectPath,
+        projectPath: cfg.projectPath,
+        scripts: cfg.acceptanceScript ? [cfg.acceptanceScript] : [],
+        isGitRepository: true,
+      });
+    } else {
+      setProjectPath('');
+      setAcceptanceScript('');
+      setInspectedProject(null);
+    }
+  }
+
+  async function saveProjectConfig(convId, cfg, currentToken = token) {
+    if (!convId || !currentToken) return null;
+    const res = await apiRequest(currentToken, `/api/conversations/${convId}/project-config`, {
+      method: 'PUT',
+      body: cfg,
+    });
+    return res?.projectConfig ?? null;
+  }
+
   async function openConversation(id, currentToken = token) {
     streamAbortRef.current?.abort();
     const conv = await apiRequest(currentToken, `/api/conversations/${id}`);
     setActiveConvId(conv.id);
     setDetachedRun(false);
     setMessages(conv.messages ?? []);
+    if (conv.projectConfig) applyProjectConfig(conv.projectConfig);
     const lastRunId = conv.runIds?.at(-1);
     if (lastRunId) {
       try {
@@ -82,22 +128,59 @@ export default function App() {
     }
   }
 
-  async function checkConnection() {
+  async function checkConnection(overrideToken, silent = false) {
+    const candidate = typeof overrideToken === 'string' ? overrideToken : token;
+    if (!candidate.trim()) return;
     try {
       setBusy(true);
       setError('');
-      const diag = await apiRequest(token, '/api/diagnostics');
+      const diag = await apiRequest(candidate, '/api/diagnostics');
+      window.sessionStorage.setItem(SESSION_TOKEN_KEY, candidate);
       setDiagnostics(diag);
-      const list = await refreshConversationList(token);
+      apiRequest(candidate, '/api/settings').then(data => {
+        if (data?.settings) setChatSettings(data.settings);
+        if (data?.availableModels) setAvailableModels(data.availableModels);
+      }).catch(() => {});
+      const list = await refreshConversationList(candidate);
       if (list.length > 0) {
-        await openConversation(list[0].id, token);
+        await openConversation(list[0].id, candidate);
       }
     } catch (e) {
+      window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
       setDiagnostics(null);
-      setError(e.message);
+      if (!silent) {
+        setError(
+          /Failed to fetch|NetworkError/i.test(e.message)
+            ? 'No se pudo conectar con el servidor local. Verifica que esté activo y pega el token actual.'
+            : e.message,
+        );
+      }
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleUpdateChatSettings(patch) {
+    try {
+      const res = await apiRequest(token, '/api/settings', { method: 'PUT', body: patch });
+      if (res?.settings) setChatSettings(res.settings);
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  function handleDisconnect() {
+    streamAbortRef.current?.abort();
+    window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
+    setToken('');
+    setDiagnostics(null);
+    setConversations([]);
+    setActiveConvId(null);
+    setMessages([]);
+    setRun(null);
+    setEvents([]);
+    setSavedProjectConfig(null);
+    setError('');
   }
 
   function startSse(runId, convId, currentToken = token) {
@@ -108,6 +191,17 @@ export default function App() {
       signal: ac.signal,
       onEvent(ev) {
         setEvents(prev => (prev.some(x => x.seq === ev.seq) ? prev : [...prev, ev]));
+        if (ev.type === 'delegation.phase' && ev.delegation) {
+          setRun(current => current ? {
+            ...current,
+            memory: {
+              ...current.memory,
+              delegation: (current.memory?.delegation ?? []).map(item => (
+                item.phase === ev.delegation.phase ? ev.delegation : item
+              )),
+            },
+          } : current);
+        }
         if (TERMINAL_EVENTS.has(ev.type)) {
           ac.abort();
           apiRequest(currentToken, `/api/runs/${runId}`).then(latest => {
@@ -132,12 +226,19 @@ export default function App() {
       setBusy(true);
       setError('');
       streamAbortRef.current?.abort();
-      const conv = await apiRequest(token, '/api/conversations', { method: 'POST' });
+      const suggestedConfig = sourceType === 'local-project' && inspectedProject && acceptanceScript
+        ? { sourceType: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript }
+        : { sourceType: 'template' };
+      const conv = await apiRequest(token, '/api/conversations', {
+        method: 'POST',
+        body: { projectConfig: suggestedConfig },
+      });
       setActiveConvId(conv.id);
       setMessages([]);
       setRun(null);
       setEvents([]);
       setDetachedRun(false);
+      if (conv.projectConfig) applyProjectConfig(conv.projectConfig);
       await refreshConversationList();
     } catch (e) {
       setError(e.message);
@@ -147,38 +248,82 @@ export default function App() {
   }
 
   async function handleSendMessage(text) {
-    if (!sourceReady) return false;
     try {
       setSending(true);
       setError('');
-      const source = sourceType === 'local-project'
-        ? { type: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript }
-        : { type: 'template' };
-      const createdRun = await apiRequest(token, '/api/runs', {
+      let convId = activeConvId;
+      if (!convId) {
+        const created = await apiRequest(token, '/api/conversations', { method: 'POST' });
+        convId = created.id;
+        setActiveConvId(convId);
+      }
+      if (sourceType === 'local-project' && inspectedProject && acceptanceScript) {
+        await saveProjectConfig(convId, {
+          sourceType: 'local-project',
+          projectPath: inspectedProject.projectPath,
+          acceptanceScript,
+        });
+      } else if (sourceType === 'template') {
+        await saveProjectConfig(convId, { sourceType: 'template' });
+      }
+      const res = await apiRequest(token, `/api/conversations/${convId}/messages`, {
         method: 'POST',
-        body: { goal: text, mode: sourceType === 'local-project' ? 'codex' : mode, source },
-      });
-      const createdAt = new Date().toISOString();
-      setComposerText('');
-      setMessages(previous => [
-        ...previous,
-        { id: `local-user-${createdRun.id}`, role: 'user', text, createdAt },
-        {
-          id: `local-plan-${createdRun.id}`,
-          role: 'orchestrator',
-          text: 'Preparé un plan para esta tarea. Revísalo y pulsa Aprobar y ejecutar.',
-          createdAt,
+        body: {
+          text,
+          intent: 'chat',
+          orchestratorProvider: roles.plan === 'codex' ? 'codex' : 'antigravity',
+          mode: sourceType === 'local-project' ? 'codex' : mode,
+          budgets,
         },
-      ]);
-      setRun(createdRun);
-      setEvents(createdRun.events ?? []);
-      setDetachedRun(true);
+      });
+      setComposerText('');
+      setMessages(res.conversation.messages ?? []);
+      if (res.run) {
+        setRun(res.run);
+        setEvents(res.run.events ?? []);
+      }
+      setDetachedRun(false);
+      await refreshConversationList();
       return true;
     } catch (e) {
       setError(e.message);
       return false;
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handleConvertToTask(planText) {
+    if (!activeConvId) return;
+    setShowProjectPicker(true);
+    if (sourceType === 'local-project' && (!inspectedProject || !acceptanceScript)) {
+      setError('Elige primero el proyecto y la prueba de aceptación arriba, luego vuelve a pulsar Convertir en tarea.');
+      return;
+    }
+    try {
+      setBusy(true);
+      setError('');
+      await saveProjectConfig(
+        activeConvId,
+        sourceType === 'local-project'
+          ? { sourceType: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript }
+          : { sourceType: 'template' },
+      );
+      const activeSkillIds = skills.filter(s => s.status === 'active').map(s => s.id);
+      const res = await apiRequest(token, `/api/conversations/${activeConvId}/convert-to-task`, {
+        method: 'POST',
+        body: { goal: planText, mode: sourceType === 'local-project' ? 'codex' : mode, budgets, activeSkills: activeSkillIds },
+      });
+      setMessages(res.conversation.messages ?? []);
+      if (res.run) {
+        setRun(res.run);
+        setEvents(res.run.events ?? []);
+      }
+      await refreshConversationList();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -272,6 +417,24 @@ export default function App() {
           {diagnostics && <span className="status-pill">Conectado localmente</span>}
           <button
             type="button"
+            className="secondary sm mobile-only"
+            onClick={() => setMobilePanel(p => (p === 'left' ? null : 'left'))}
+            aria-expanded={mobilePanel === 'left'}
+            aria-label="Mostrar u ocultar historial de chats"
+          >
+            Chats
+          </button>
+          <button
+            type="button"
+            className="secondary sm mobile-only"
+            onClick={() => setMobilePanel(p => (p === 'right' ? null : 'right'))}
+            aria-expanded={mobilePanel === 'right'}
+            aria-label="Mostrar u ocultar equipo activo"
+          >
+            Equipo
+          </button>
+          <button
+            type="button"
             className="secondary sm"
             onClick={() => setSettingsOpen(true)}
             aria-label="Abrir ajustes"
@@ -281,16 +444,27 @@ export default function App() {
         </div>
       </header>
 
-      <div className="shell-grid">
+      <div className={`shell-grid${mobilePanel ? ` show-${mobilePanel}` : ''}`}>
         <Sidebar title="Chats" side="left">
           <HistoryList
             items={conversations}
             activeId={activeConvId}
             connected={Boolean(diagnostics)}
             onNewTask={handleNewTask}
-            onSelect={id => openConversation(id).catch(e => setError(e.message))}
+            onSelect={id => {
+              setMobilePanel(null);
+              openConversation(id).catch(e => setError(e.message));
+            }}
             busy={busy}
           />
+          <button
+            type="button"
+            className="secondary full sidebar-settings-btn"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Abrir ajustes desde la barra lateral"
+          >
+            <IconSettings /> Ajustes
+          </button>
         </Sidebar>
 
         <ChatWorkspace
@@ -304,10 +478,13 @@ export default function App() {
           events={events}
           skills={skills}
           onSendMessage={handleSendMessage}
+          onConvertToTask={handleConvertToTask}
           onApprove={approveRun}
           onCancel={cancelActiveRun}
           onNewTask={handleNewTask}
           onOpenSettings={() => setSettingsOpen(true)}
+          showProjectPicker={showProjectPicker}
+          onToggleProjectPicker={() => setShowProjectPicker(v => !v)}
           sending={sending}
           busy={busy}
           error={error}
@@ -323,14 +500,19 @@ export default function App() {
             inspecting: inspectingProject,
             error: projectError,
             ready: sourceReady,
+            savedConfig: savedProjectConfig,
           }}
         />
 
         <Sidebar title="Equipo activo" side="right">
           <ActiveTeamPanel
             diagnostics={diagnostics}
-            usageLevels={usageLevels}
+            runUsage={run?.usage}
             activeAgent={activeAgent}
+            chatSettings={chatSettings}
+            savedProjectConfig={savedProjectConfig}
+            isRunning={run?.status === 'running'}
+            onOpenProjectPicker={() => setShowProjectPicker(true)}
           />
         </Sidebar>
       </div>
@@ -343,15 +525,55 @@ export default function App() {
         mode={mode}
         setMode={setMode}
         diagnostics={diagnostics}
-        onCheckConnection={checkConnection}
+        onCheckConnection={() => checkConnection()}
+        onDisconnect={handleDisconnect}
         roles={roles}
         setRoles={setRoles}
         skills={skills}
         setSkills={setSkills}
         usageLevels={usageLevels}
         setUsageLevels={setUsageLevels}
+        budgets={budgets}
+        setBudgets={setBudgets}
+        chatSettings={chatSettings}
+        availableModels={availableModels}
+        onUpdateChatSettings={handleUpdateChatSettings}
         busy={busy}
         error={error}
+      />
+      <ProjectModal
+        open={showProjectPicker}
+        onClose={() => setShowProjectPicker(false)}
+        onConfirm={async () => {
+          let convId = activeConvId;
+          if (!convId && diagnostics) {
+            const created = await apiRequest(token, '/api/conversations', { method: 'POST' });
+            convId = created.id;
+            setActiveConvId(convId);
+          }
+          const cfg = sourceType === 'local-project'
+            ? { sourceType: 'local-project', projectPath: inspectedProject.projectPath, acceptanceScript, targetScope }
+            : { sourceType: 'template', targetScope };
+          const saved = await saveProjectConfig(convId, cfg);
+          if (saved) setSavedProjectConfig(saved);
+          setShowProjectPicker(false);
+        }}
+        projectConfig={{
+          sourceType,
+          onSourceTypeChange: changeSourceType,
+          projectPath,
+          onProjectPathChange: changeProjectPath,
+          project: inspectedProject,
+          acceptanceScript,
+          onAcceptanceScriptChange: setAcceptanceScript,
+          onInspect: inspectProject,
+          inspecting: inspectingProject,
+          error: projectError,
+          savedConfig: savedProjectConfig,
+        }}
+        targetScope={targetScope}
+        setTargetScope={setTargetScope}
+        disabled={!diagnostics || busy}
       />
     </div>
   );

@@ -1,10 +1,11 @@
 import { useEffect, useRef } from 'react';
 import {
-  IconCheck, IconDownload, IconFile, IconPlay, IconStop,
+  IconCheck, IconDownload, IconFile, IconLogo, IconPlay, IconStop,
 } from './Icons.jsx';
 import { ChatMessage, StatusBadge } from './UiPrimitives.jsx';
 import TooltipInfo from './TooltipInfo.jsx';
 import ChatComposer from './ChatComposer.jsx';
+import OddDelegationCard from './OddDelegationCard.jsx';
 import ProjectSelector from './ProjectSelector.jsx';
 
 function formatDuration(startedAt, completedAt) {
@@ -50,8 +51,8 @@ export default function ChatWorkspace({
   connected, diagnostics, mode,
   composerText, setComposerText,
   messages, run, events, skills,
-  onSendMessage, onApprove, onCancel, onNewTask, onOpenSettings,
-  projectConfig,
+  onSendMessage, onConvertToTask, onApprove, onCancel, onNewTask, onOpenSettings,
+  projectConfig, showProjectPicker, onToggleProjectPicker,
   sending, busy, error,
 }) {
   const endRef = useRef(null);
@@ -61,7 +62,8 @@ export default function ChatWorkspace({
   const isTerminal = run && ['completed', 'failed', 'cancelled'].includes(run.status);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const reduced = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    endRef.current?.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'end' });
   }, [messages.length, events.length, run?.status]);
 
   const activity = buildActivityMessages(events);
@@ -72,6 +74,7 @@ export default function ChatWorkspace({
   const agentsUsed = [...new Set((run?.memory?.steps ?? []).map(s => s.agent))];
   const retries = (run?.memory?.steps ?? []).filter(s => s.agent === 'codex-fix').length;
   const activeSkills = skills.filter(s => s.status === 'active').map(s => s.name);
+  const appliedSkillNames = (run?.memory?.skills ?? []).map(id => skills.find(skill => skill.id === id)?.name ?? id);
   const isLocalProject = run?.source?.type === 'local-project';
   const sourceName = isLocalProject
     ? (projectConfig.project?.projectPath === run.source.projectPath ? projectConfig.project.name : run.source.projectPath)
@@ -87,7 +90,9 @@ export default function ChatWorkspace({
   const evidencePayload = run ? {
     objetivo: run.goal,
     modo: run.mode === 'codex' ? 'Ejecución local real' : 'Modo demostración',
-    skillsActivas: activeSkills,
+    oddActivo: true,
+    skillsActivas: run.memory?.skills ?? activeSkills,
+    delegacion: run.memory?.delegation ?? [],
     agentesUsados: agentsUsed,
     fuente: sourceName,
     archivosModificados: modifiedFiles,
@@ -112,25 +117,59 @@ export default function ChatWorkspace({
             role="assistant"
             author="OmniPilot"
             meta={(
-              <span className={mode === 'codex' ? 'mode-pill real' : 'mode-pill demo'}>
-                {mode === 'codex' ? 'Ejecución local real' : 'Modo demostración'}
+              <span className="row-inline">
+                <span className={mode === 'codex' ? 'mode-pill real' : 'mode-pill demo'}>
+                  {mode === 'codex' ? 'Ejecución local real' : 'Modo demostración'}
+                </span>
+                <button type="button" className="secondary sm" onClick={onToggleProjectPicker}>
+                  {showProjectPicker ? 'Ocultar proyecto' : 'Elegir proyecto'}
+                </button>
               </span>
             )}
           >
-            <p>Escribe un saludo, pregunta por los agentes o describe una tarea de código. Prepararé un plan antes de ejecutar cualquier cambio.</p>
+            <p>Pregúntame lo que necesites o pídeme un plan conceptual. No crearé runs ni modificaré archivos hasta que decidas convertir una idea en tarea y aprobarla.</p>
           </ChatMessage>
         )}
 
+        {projectConfig.savedConfig && (
+          <div className="project-chip-bar">
+            <button type="button" className="project-chip-btn" onClick={onToggleProjectPicker}>
+              <IconFile /> Proyecto: {projectConfig.savedConfig.projectName} · prueba: {projectConfig.savedConfig.acceptanceScript}
+              {projectConfig.savedConfig.targetScope ? ` · foco: ${projectConfig.savedConfig.targetScope}` : ''}
+            </button>
+          </div>
+        )}
+
         {messages.map(m => (
-          <ChatMessage
-            key={m.id}
-            role={m.role === 'user' ? 'user' : 'assistant'}
-            author={m.role === 'user' ? 'Tú' : 'OmniPilot'}
-            meta={<time className="mono-time">{m.createdAt.slice(11, 19)}</time>}
-          >
-            <p>{m.text}</p>
-          </ChatMessage>
+          <div key={m.id} className={m.role === 'user' ? 'bubble-row user' : 'bubble-row assistant'}>
+            {m.role !== 'user' && <span className="bubble-avatar"><IconLogo size={16} /></span>}
+            <div className={m.role === 'user' ? 'bubble user' : 'bubble assistant'}>
+              <p>{m.text}</p>
+              {m.type === 'needs-project' && (
+                <div className="inline-actions">
+                  <button type="button" className="primary sm" onClick={onToggleProjectPicker} disabled={busy}>
+                    Seleccionar proyecto
+                  </button>
+                </div>
+              )}
+              {m.type === 'plan-conceptual' && !run && (
+                <div className="inline-actions">
+                  <button type="button" className="primary sm" onClick={() => onConvertToTask(m.text)} disabled={busy}>
+                    Convertir en tarea
+                  </button>
+                </div>
+              )}
+              <time className="bubble-time">{m.createdAt.slice(11, 19)}</time>
+            </div>
+          </div>
         ))}
+
+        {sending && (
+          <div className="activity-row">
+            <span className="activity-actor">Orquestador</span>
+            <span className="activity-text">Orquestador pensando…</span>
+          </div>
+        )}
 
         {run && (
           <ChatMessage
@@ -163,6 +202,7 @@ export default function ChatWorkspace({
                 </li>
               ))}
             </ol>
+            <OddDelegationCard delegation={run.memory?.delegation} isTerminal={isTerminal} />
             <div className="inline-actions">
               {isPending && (
                 <button type="button" className="primary" onClick={onApprove} disabled={busy}>
@@ -209,13 +249,22 @@ export default function ChatWorkspace({
             <details className="fold-block">
               <summary>Ficha de evidencia</summary>
               <dl className="evidence-dl">
+                <div><dt>Orquestación</dt><dd><strong>ODD activo</strong></dd></div>
                 <div><dt>Objetivo</dt><dd>{evidencePayload.objetivo}</dd></div>
-                <div><dt>Skills activas</dt><dd>{activeSkills.join(', ') || 'Ninguna'}</dd></div>
+                <div><dt>Skills aplicadas</dt><dd>{appliedSkillNames.join(', ') || activeSkills.join(', ') || 'ODD · Orchestrator-Driven Development'}</dd></div>
                 <div><dt>Agentes usados</dt><dd>{agentsUsed.join(', ') || '—'}</dd></div>
                 <div><dt>Fuente</dt><dd>{evidencePayload.fuente}</dd></div>
                 <div><dt>Archivos modificados</dt><dd className="mono-inline">{modifiedFiles.join(', ') || 'Ninguno'}</dd></div>
                 <div><dt>Prueba de aceptación</dt><dd className="mono-inline">{evidencePayload.pruebaDeAceptacion}</dd></div>
                 <div><dt>Duración</dt><dd className="mono-inline">{evidencePayload.duracion}</dd></div>
+                <div>
+                  <dt>Consumo local (Codex / Antigravity)</dt>
+                  <dd className="mono-inline">
+                    {run.usage?.codex?.level === 'unavailable' ? 'no reportado' : `${run.usage?.codex?.tokens ?? 0}/${run.usage?.codex?.budget ?? 0}`}
+                    {' · '}
+                    {run.usage?.antigravity?.level === 'unavailable' ? 'no reportado' : `${run.usage?.antigravity?.tokens ?? 0}/${run.usage?.antigravity?.budget ?? 0}`}
+                  </dd>
+                </div>
                 <div><dt>Estado final</dt><dd>{resultLabel}</dd></div>
               </dl>
               <p className="copy-note">OmniPilot trabajó sobre una copia temporal. El proyecto original no se modificó.</p>
