@@ -6,7 +6,7 @@ import { z } from 'zod';
 const planStepSchema = z.object({
   id: z.number(),
   role: z.string(),
-  agent: z.string(),
+  agent: z.string().default(''),
   title: z.string(),
 });
 
@@ -28,23 +28,42 @@ const sourceSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
+const delegationPhaseSchema = z.object({
+  phase: z.string(),
+  role: z.string(),
+  agent: z.string(),
+  provider: z.string(),
+  permission: z.string(),
+  reason: z.string(),
+  status: z.enum(['pendiente', 'activo', 'completado', 'fallido', 'omitido']).default('pendiente'),
+  ms: z.number().default(0),
+  result: z.string().nullable().default(null),
+});
+
 export const memorySchema = z.object({
   goal: z.string(),
   plan: z.array(planStepSchema).default([]),
   acceptance: z.string().default(''),
   source: sourceSchema.default({ type: 'template' }),
+  skills: z.array(z.string()).default(['orchestrator-driven-development']),
+  delegation: z.array(delegationPhaseSchema).default([]),
   decisions: z.array(z.string()).default([]),
   steps: z.array(stepSchema),
   problems: z.array(z.string()),
   updatedAt: z.string(),
 });
 
-export function newMemory(goal, { plan = [], acceptance = '', source = { type: 'template' } } = {}) {
+export function newMemory(
+  goal,
+  { plan = [], acceptance = '', source = { type: 'template' }, skills = ['orchestrator-driven-development'], delegation = [] } = {},
+) {
   return {
     goal,
     plan,
     acceptance,
     source,
+    skills,
+    delegation,
     decisions: [],
     steps: [],
     problems: [],

@@ -1,18 +1,36 @@
 import express from 'express';
-import { resolve } from 'node:path';
+import { resolve, isAbsolute } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createRun, getRun, publicRun, startRun, cancelRun, subscribe, markApproved } from '../orchestrator/orchestrator.js';
 import { codexConnector } from '../connectors/codexConnector.js';
 import { antigravityConnector } from '../connectors/antigravityConnector.js';
 import { createConversationStore } from '../memory/conversationStore.js';
+import { createSettingsStore } from '../memory/settingsStore.js';
 import { classifyMessage } from '../orchestrator/messageClassifier.js';
+import { runOrchestratorChat } from '../orchestrator/chatOrchestrator.js';
 import { inspectLocalProject, validateLocalProjectSource } from '../projects/localProjects.js';
+
+export const DEFAULT_CONVERSATIONS_DIR = fileURLToPath(new URL('../../../data/conversations', import.meta.url));
+export const DEFAULT_SETTINGS_PATH = fileURLToPath(new URL('../../../data/settings.json', import.meta.url));
+
+function sanitizeTargetScope(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') throw new Error('Archivo objetivo inválido');
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > 160 || isAbsolute(trimmed) || /^[A-Za-z]:[\\/]/.test(trimmed) || trimmed.split(/[\\/]+/).includes('..')) {
+    throw new Error('Archivo objetivo inválido: usa una ruta relativa sin ".." ni rutas absolutas');
+  }
+  return trimmed;
+}
 
 export function createApp({
   token,
   port = Number(process.env.PORT ?? 4317),
   workspacesDir = resolve('workspaces'),
   projectsRoot = process.env.PROJECTS_ROOT,
-  conversationsDir = resolve('data', 'conversations'),
+  conversationsDir = DEFAULT_CONVERSATIONS_DIR,
+  settingsPath = DEFAULT_SETTINGS_PATH,
   codex = codexConnector,
   antigravity = antigravityConnector,
   antigravityValidated = true,
@@ -24,6 +42,7 @@ export function createApp({
   app.use(express.json({ limit: '16kb' }));
 
   const conversations = createConversationStore(conversationsDir);
+  const settingsStore = createSettingsStore(settingsPath);
   const runToConversation = new Map();
   const allowedOrigins = new Set(['http://127.0.0.1:5173', 'http://localhost:5173']);
 
@@ -45,7 +64,7 @@ export function createApp({
     }
     if (req.method === 'OPTIONS') {
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Omni-Token');
-      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
       return res.sendStatus(204);
     }
     next();
@@ -75,6 +94,33 @@ export function createApp({
     res.json({ provider: 'codex', ...status });
   });
 
+  app.get('/api/settings', async (_req, res) => {
+    try {
+      const [settings, agyModels] = await Promise.all([
+        settingsStore.get(),
+        antigravityValidated && typeof antigravity?.listModels === 'function'
+          ? antigravity.listModels().catch(() => [])
+          : Promise.resolve([]),
+      ]);
+      res.json({ settings, availableModels: { antigravity: agyModels } });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.put('/api/settings', async (req, res) => {
+    try {
+      const updated = await settingsStore.update({
+        ...(req.body?.chatProvider !== undefined ? { chatProvider: req.body.chatProvider } : {}),
+        ...(req.body?.chatModel !== undefined ? { chatModel: req.body.chatModel } : {}),
+        ...(req.body?.chatStyle !== undefined ? { chatStyle: req.body.chatStyle } : {}),
+      });
+      res.json({ settings: updated });
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   app.post('/api/projects/inspect', async (req, res) => {
     try {
       const project = await inspectLocalProject({ projectsRoot, projectPath: req.body?.projectPath });
@@ -92,12 +138,35 @@ export function createApp({
     }
   });
 
-  app.post('/api/conversations', async (_req, res) => {
+  app.post('/api/conversations', async (req, res) => {
     try {
-      const conv = await conversations.create();
+      const requested = req.body?.projectConfig;
+      let projectConfig = null;
+      if (requested?.sourceType === 'template') {
+        projectConfig = {
+          sourceType: 'template',
+          projectName: 'Plantilla de demostración',
+          acceptanceScript: 'node --test password.test.js',
+          updatedAt: new Date().toISOString(),
+        };
+      } else if (requested?.sourceType === 'local-project' && requested.projectPath && requested.acceptanceScript) {
+        const validated = await validateLocalProjectSource({
+          projectsRoot,
+          projectPath: requested.projectPath,
+          acceptanceScript: requested.acceptanceScript,
+        });
+        projectConfig = {
+          sourceType: 'local-project',
+          projectPath: validated.projectPath,
+          projectName: validated.projectName || validated.projectPath,
+          acceptanceScript: validated.acceptanceScript,
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      const conv = await conversations.create({ projectConfig });
       res.status(201).json(conv);
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      res.status(400).json({ error: e.message });
     }
   });
 
@@ -107,6 +176,43 @@ export function createApp({
       return conv ? res.json(conv) : res.sendStatus(404);
     } catch {
       return res.sendStatus(404);
+    }
+  });
+
+  app.put('/api/conversations/:id/project-config', async (req, res) => {
+    try {
+      const conv = await conversations.get(req.params.id);
+      if (!conv) return res.sendStatus(404);
+      const sourceType = req.body?.sourceType;
+      const targetScope = sanitizeTargetScope(req.body?.targetScope);
+      let normalized;
+      if (sourceType === 'template') {
+        normalized = {
+          sourceType: 'template',
+          projectName: 'Plantilla de demostración',
+          acceptanceScript: 'node --test password.test.js',
+          ...(targetScope ? { targetScope } : {}),
+        };
+      } else if (sourceType === 'local-project') {
+        const validated = await validateLocalProjectSource({
+          projectsRoot,
+          projectPath: req.body?.projectPath,
+          acceptanceScript: req.body?.acceptanceScript,
+        });
+        normalized = {
+          sourceType: 'local-project',
+          projectPath: validated.projectPath,
+          projectName: validated.projectName || validated.projectPath,
+          acceptanceScript: validated.acceptanceScript,
+          ...(targetScope ? { targetScope } : {}),
+        };
+      } else {
+        return res.status(400).json({ error: 'sourceType inválido' });
+      }
+      const updated = await conversations.setProjectConfig(conv.id, normalized);
+      return res.json({ projectConfig: updated.projectConfig, conversation: updated });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
     }
   });
 
@@ -123,13 +229,44 @@ export function createApp({
     }
     if (!conv) return res.sendStatus(404);
 
-    const { message: userMessage } = await conversations.appendMessage(conv.id, { role: 'user', text });
+    const { message: userMessage } = await conversations.appendMessage(conv.id, { role: 'user', type: 'chat', text });
+
+    if (req.body?.intent === 'chat') {
+      const saved = await settingsStore.get();
+      const provider = req.body?.orchestratorProvider || saved.chatProvider || 'auto';
+      const chatRes = await runOrchestratorChat({
+        provider,
+        model: saved.chatModel,
+        style: saved.chatStyle,
+        messages: [...conv.messages, userMessage],
+        text,
+        hasProject: Boolean(conv.projectConfig),
+        codex,
+        antigravity,
+        antigravityValidated,
+      });
+      const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+        role: 'orchestrator',
+        type: chatRes.type,
+        text: chatRes.text,
+      });
+      return res.status(201).json({ conversation, userMessage, reply, run: null });
+    }
+
     const kind = classifyMessage(text);
 
     if (kind === 'greeting') {
       const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
         role: 'orchestrator',
         text: '¡Hola! Describe el cambio que quieres realizar y prepararé un plan antes de ejecutar.',
+      });
+      return res.status(201).json({ conversation, userMessage, reply, run: null });
+    }
+
+    if (kind === 'conversation') {
+      const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+        role: 'orchestrator',
+        text: 'Entendido. Cuando quieras, describe una tarea concreta de código o proyecto.',
       });
       return res.status(201).json({ conversation, userMessage, reply, run: null });
     }
@@ -168,8 +305,36 @@ export function createApp({
       return res.status(201).json({ conversation, userMessage, reply, run: null });
     }
 
-    // Code task: create deterministic pending plan without executing agents
-    const run = createRun(text, mode);
+    // Code task: require valid projectConfig, re-validate local-project, create pending plan without executing
+    if (!conv.projectConfig) {
+      const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+        role: 'orchestrator',
+        text: 'Antes de preparar un plan, elige el proyecto y la prueba de aceptación en el selector superior.',
+      });
+      return res.status(201).json({ conversation, userMessage, reply, run: null });
+    }
+
+    let source;
+    if (conv.projectConfig.sourceType === 'local-project') {
+      try {
+        const validated = await validateLocalProjectSource({
+          projectsRoot,
+          projectPath: conv.projectConfig.projectPath,
+          acceptanceScript: conv.projectConfig.acceptanceScript,
+        });
+        source = {
+          type: 'local-project',
+          projectPath: validated.projectPath,
+          acceptanceScript: validated.acceptanceScript,
+        };
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    } else {
+      source = { type: 'template' };
+    }
+
+    const run = createRun(text, mode, source, req.body?.budgets, req.body?.activeSkills);
     runToConversation.set(run.id, conv.id);
     await conversations.attachRun(conv.id, run.id, 'plan_pending');
     const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
@@ -178,6 +343,50 @@ export function createApp({
       runId: run.id,
     });
     return res.status(201).json({ conversation, userMessage, reply, run: publicRun(run) });
+  });
+
+  app.post('/api/conversations/:id/convert-to-task', async (req, res) => {
+    let conv;
+    try {
+      conv = await conversations.get(req.params.id);
+    } catch {
+      return res.sendStatus(404);
+    }
+    if (!conv) return res.sendStatus(404);
+    if (!conv.projectConfig) {
+      return res.status(400).json({ error: 'Selecciona primero un proyecto y prueba de aceptación.' });
+    }
+    const goalText = typeof req.body?.goal === 'string' && req.body.goal.trim()
+      ? req.body.goal.trim().slice(0, 1200)
+      : (conv.messages.find(m => m.role === 'user')?.text || conv.title);
+    const mode = req.body?.mode === 'demo' ? 'demo' : 'codex';
+
+    let source;
+    if (conv.projectConfig.sourceType === 'local-project') {
+      try {
+        const validated = await validateLocalProjectSource({
+          projectsRoot,
+          projectPath: conv.projectConfig.projectPath,
+          acceptanceScript: conv.projectConfig.acceptanceScript,
+        });
+        source = { type: 'local-project', projectPath: validated.projectPath, acceptanceScript: validated.acceptanceScript };
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    } else {
+      source = { type: 'template' };
+    }
+
+    const run = createRun(goalText, mode, source, req.body?.budgets, req.body?.activeSkills);
+    runToConversation.set(run.id, conv.id);
+    await conversations.attachRun(conv.id, run.id, 'plan_pending');
+    const { conversation, message: reply } = await conversations.appendMessage(conv.id, {
+      role: 'orchestrator',
+      type: 'tarea',
+      text: 'Plan ejecutable listo. Revísalo y pulsa Aprobar y ejecutar.',
+      runId: run.id,
+    });
+    return res.status(201).json({ conversation, reply, run: publicRun(run) });
   });
 
   app.post('/api/runs', async (req, res) => {
@@ -196,7 +405,7 @@ export function createApp({
       } else {
         throw new Error('Tipo de source inválido');
       }
-      const run = createRun(req.body?.goal, req.body?.mode, source);
+      const run = createRun(req.body?.goal, req.body?.mode, source, req.body?.budgets, req.body?.activeSkills);
       res.status(201).json(publicRun(run));
     } catch (e) {
       res.status(400).json({ error: e.message });
@@ -212,6 +421,17 @@ export function createApp({
     const run = getRun(req.params.id);
     if (!run) return res.sendStatus(404);
     if (run.status !== 'pending') return res.status(409).json({ error: 'Estado inválido' });
+    if (run.source?.type === 'local-project') {
+      try {
+        await validateLocalProjectSource({
+          projectsRoot,
+          projectPath: run.source.projectPath,
+          acceptanceScript: run.source.acceptanceScript,
+        });
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    }
     markApproved(run);
     const convId = runToConversation.get(run.id);
     if (convId) await conversations.updateStatus(convId, 'running');

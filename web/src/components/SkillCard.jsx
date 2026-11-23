@@ -9,16 +9,18 @@ const LABELS = {
 
 export default function SkillCard({ skill, onToggle }) {
   const meta = LABELS[skill.status] || LABELS.suggested;
+  const locked = skill.id === 'orchestrator-driven-development';
   return (
     <button
       type="button"
       className={`skill-card ${skill.status}`}
       onClick={() => onToggle(skill.id)}
-      aria-label={`Cambiar estado de skill ${skill.name}`}
+      disabled={locked}
+      aria-label={locked ? `${skill.name}, siempre activa` : `Cambiar estado de skill ${skill.name}`}
     >
       <div className="between">
         <strong className="skill-name"><IconSpark /> {skill.name}</strong>
-        <StatusBadge variant={meta.variant}>{meta.text}</StatusBadge>
+        <StatusBadge variant={meta.variant}>{locked ? 'Siempre activa' : meta.text}</StatusBadge>
       </div>
       <p className="muted">{skill.description}</p>
     </button>
