@@ -10,8 +10,8 @@ export const AGENT_REGISTRY = Object.freeze({
   antigravity: Object.freeze({
     id: 'antigravity',
     provider: 'Antigravity',
-    capabilities: Object.freeze(['plan', 'review', 'chat']),
-    allowedPermissions: Object.freeze(['read-only']),
+    capabilities: Object.freeze(['plan', 'review', 'chat', 'code-write', 'fix']),
+    allowedPermissions: Object.freeze(['read-only', 'accept-edits']),
   }),
   'local-verifier': Object.freeze({
     id: 'local-verifier',
@@ -21,12 +21,13 @@ export const AGENT_REGISTRY = Object.freeze({
   }),
 });
 
-export function canAgentRun(agentId, requiredCapability, permission) {
-  const entry = AGENT_REGISTRY[agentId];
+export function canAgentRun(agentId, requiredCapability, permission, registry = AGENT_REGISTRY) {
+  const entry = registry?.[agentId];
   if (!entry) return false;
   if (!entry.capabilities.includes(requiredCapability)) return false;
   if (!entry.allowedPermissions.includes(permission)) return false;
-  if (permission === 'workspace-write' && !entry.capabilities.includes('code-write')) return false;
+  const isWritePermission = permission === 'workspace-write' || permission === 'accept-edits';
+  if (isWritePermission && !entry.capabilities.includes('code-write')) return false;
   return true;
 }
 

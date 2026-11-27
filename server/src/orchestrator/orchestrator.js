@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { mkdir, writeFile, appendFile, readFile, access } from 'node:fs/promises';
 import { createPlan } from './plan.js';
-import { route } from './router.js';
+import { route, canAgentRun } from './router.js';
 import { newMemory, writeMemory, buildBoundedContext } from '../memory/store.js';
 import { runProcess } from '../connectors/processRunner.js';
 import { codexConnector } from '../connectors/codexConnector.js';
@@ -238,6 +238,7 @@ export async function startRun(
     runner = runProcess,
     projectsRoot,
     enforceBudget = false,
+    agentRegistry,
   } = {},
 ) {
   if (run.status !== 'pending') throw new Error('Ejecución ya iniciada');
@@ -297,7 +298,7 @@ export async function startRun(
     if (run.mode === 'demo') {
       await runDemoFlow({ run, workspace, runner, logEvent, recordStep, recordDelegation, assertNotCancelled });
     } else {
-      await runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget });
+      await runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget, agentRegistry });
     }
   } catch (error) {
     const cancelled = run.controller.signal.aborted && !executionTimedOut;
@@ -362,7 +363,25 @@ async function runDemoFlow({ run, workspace, runner, logEvent, recordStep, recor
   run.status = result.code === 0 ? 'completed' : 'failed';
 }
 
-async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget = false }) {
+async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget = false, agentRegistry }) {
+  async function assertAgentPermitted(step, agentId, capability, permission) {
+    if (canAgentRun(agentId, capability, permission, agentRegistry)) return;
+    const message = `Agente no permitido: ${agentId} (${capability} / ${permission})`;
+    await logEvent('step.failed', message, {
+      step,
+      agent: `${agentId}-${step}`,
+      reason: 'agent_not_permitted',
+      agentId,
+      capability,
+      permission,
+    });
+    throw new Error(message);
+  }
+  async function antigravityUsable(capability, permission) {
+    if (!antigravityValidated || !antigravity) return false;
+    if (!canAgentRun('antigravity', capability, permission, agentRegistry)) return false;
+    return Boolean((await antigravity.isAvailable({ signal: run.controller.signal })).available);
+  }
   if (run.source.type === 'template') {
     await writeFile(join(workspace, 'package.json'), '{"type":"module"}\n');
     await writeFile(join(workspace, 'password.test.js'), testSource);
@@ -379,10 +398,11 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   await logEvent('step.started', 'Iniciando implementación (Codex workspace-write)', { step: 'implement', agent: 'codex-implement' });
   let codexFailedInRun = false;
   let implAgent = 'codex-implement';
+  await assertAgentPermitted('implement', 'codex', 'code-write', 'workspace-write');
   let impl = await codex.run(implPrompt, { workspace, sandbox: 'workspace-write', timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
   recordProviderUsage(run.usage, 'codex', impl.usage?.totalTokens ?? null);
 
-  if (!impl.ok && antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available) {
+  if (!impl.ok && await antigravityUsable('code-write', 'accept-edits')) {
     codexFailedInRun = true;
     const reason = impl.timedOut ? 'Codex agotó tiempo de espera' : 'Codex falló o sin crédito';
     await logEvent('log', `${reason}; cambiando automáticamente a Antigravity (accept-edits --sandbox)`, { fallback: true, reason });
@@ -394,6 +414,7 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
       fallbackReason: `${reason}; fallback automático a Antigravity.`,
       status: 'activo',
     });
+    await assertAgentPermitted('implement', 'antigravity', 'code-write', 'accept-edits');
     const agyImpl = await antigravity.run(implPrompt, {
       workspace,
       mode: 'accept-edits',
@@ -432,14 +453,18 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   const beforeReview = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   const reviewRules = buildSkillRulesForRole(run.memory.skills, 'review', { goal: run.goal });
   const reviewPrompt = buildPrompt('review', buildBoundedContext(run.memory, beforeReview.files), reviewRules);
-  const useAntigravity = Boolean(
-    antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available,
-  );
+  const agyReviewPermitted = canAgentRun('antigravity', 'review', 'read-only', agentRegistry);
+  const useAntigravity = await antigravityUsable('review', 'read-only');
+  const reviewFallbackReason = !agyReviewPermitted
+    ? 'Antigravity denegado por registro de agentes; fallback a Codex en solo lectura.'
+    : (antigravityValidated
+      ? 'Antigravity no disponible; fallback a Codex en solo lectura.'
+      : 'Antigravity no validado; fallback a Codex en solo lectura.');
   await recordDelegation('review', {
     provider: useAntigravity ? 'Antigravity' : 'Codex',
     agent: useAntigravity ? 'antigravity-review' : 'codex-review',
     reason: useAntigravity ? 'Revisión independiente de cambios.' : 'Revisión en modo solo lectura.',
-    fallbackReason: useAntigravity ? null : 'Antigravity no disponible; fallback a Codex en solo lectura.',
+    fallbackReason: useAntigravity ? null : reviewFallbackReason,
     status: 'activo',
   });
   let reviewerAgent = 'codex-review';
@@ -452,6 +477,7 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
     reviewerAgent = 'antigravity-review';
     await logEvent('step.started', 'Iniciando revisión (Antigravity plan+sandbox)', { step: 'review', agent: reviewerAgent });
     await logEvent('review', 'Ejecutando revisión con Antigravity (--mode plan --sandbox)');
+    await assertAgentPermitted('review', 'antigravity', 'review', 'read-only');
     const agyRes = await antigravity.run(reviewPrompt, { workspace, timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
     recordProviderUsage(run.usage, 'antigravity', agyRes.usage?.totalTokens ?? null);
     review = { ...agyRes, output: agyRes.untrustedResponse || agyRes.error || '' };
@@ -460,10 +486,13 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
       if (enforceBudget) throw new Error('Presupuesto local alcanzado para Codex; revisión detenida');
       await logEvent('usage.warning', 'Uso observado elevado para Codex (modo informativo); continuando con revisión');
     }
-    const reason = antigravityValidated ? 'Antigravity no disponible' : 'Antigravity no validado';
+    const reason = !agyReviewPermitted
+      ? 'Antigravity denegado por registro de agentes'
+      : (antigravityValidated ? 'Antigravity no disponible' : 'Antigravity no validado');
     await logEvent('step.started', 'Iniciando revisión (Codex read-only)', { step: 'review', agent: reviewerAgent, fallback: true });
     await logEvent('log', `Fallback de revisión a Codex read-only: ${reason}`, { fallback: true, reason });
     await logEvent('review', 'Ejecutando revisión con Codex (read-only)');
+    await assertAgentPermitted('review', 'codex', 'code-read', 'read-only');
     review = await codex.run(reviewPrompt, { workspace, sandbox: 'read-only', timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
     recordProviderUsage(run.usage, 'codex', review.usage?.totalTokens ?? null);
   }
@@ -507,7 +536,7 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   const fixPrompt = buildPrompt('fix', buildBoundedContext(run.memory, beforeFix.files), fixRules);
   let fixAgent = 'codex-fix';
   let fix;
-  if (codexFailedInRun && antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available) {
+  if (codexFailedInRun && await antigravityUsable('fix', 'accept-edits')) {
     fixAgent = 'antigravity-fix';
     await recordDelegation('fix', {
       provider: 'Antigravity',
@@ -517,6 +546,7 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
       status: 'activo',
     });
     await logEvent('step.started', 'Iniciando corrección única (Antigravity accept-edits)', { step: 'fix', agent: fixAgent });
+    await assertAgentPermitted('fix', 'antigravity', 'fix', 'accept-edits');
     const agyFix = await antigravity.run(fixPrompt, {
       workspace,
       mode: 'accept-edits',
@@ -529,9 +559,10 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   } else {
     await recordDelegation('fix', { status: 'activo' });
     await logEvent('step.started', 'Iniciando corrección única (Codex workspace-write)', { step: 'fix', agent: 'codex-fix' });
+    await assertAgentPermitted('fix', 'codex', 'fix', 'workspace-write');
     fix = await codex.run(fixPrompt, { workspace, sandbox: 'workspace-write', timeoutMs: AGENT_STEP_TIMEOUT_MS, signal: run.controller.signal });
     recordProviderUsage(run.usage, 'codex', fix.usage?.totalTokens ?? null);
-    if (!fix.ok && antigravityValidated && antigravity && (await antigravity.isAvailable({ signal: run.controller.signal })).available) {
+    if (!fix.ok && await antigravityUsable('fix', 'accept-edits')) {
       const reason = fix.timedOut ? 'Codex agotó tiempo de espera' : 'Codex falló o sin crédito';
       await logEvent('log', `${reason}; cambiando automáticamente a Antigravity para corrección`, { fallback: true, reason });
       fixAgent = 'antigravity-fix';
@@ -542,6 +573,7 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
         fallbackReason: `${reason}; fallback automático a Antigravity.`,
         status: 'activo',
       });
+      await assertAgentPermitted('fix', 'antigravity', 'fix', 'accept-edits');
       const agyFix = await antigravity.run(fixPrompt, {
         workspace,
         mode: 'accept-edits',

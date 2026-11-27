@@ -56,6 +56,7 @@ export function createApp({
   antigravity = antigravityConnector,
   antigravityValidated = true,
   runner,
+  agentRegistry,
 } = {}) {
   if (!token) throw new Error('Token local requerido');
   const app = express();
@@ -677,7 +678,7 @@ export function createApp({
     const convId = runToConversation.get(run.id);
     if (convId) await conversations.updateStatus(convId, 'running');
 
-    startRun(run, workspacesDir, { codex, antigravity, antigravityValidated, runner, projectsRoot })
+    startRun(run, workspacesDir, { codex, antigravity, antigravityValidated, runner, projectsRoot, agentRegistry })
       .catch(e => console.error('Run failure:', e.message))
       .finally(async () => {
         if (!convId) return;

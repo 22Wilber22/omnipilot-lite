@@ -64,7 +64,7 @@ describe('Hotfix E2E — Baseline Git con node_modules y router por capacidades'
   });
 
   it('elige Codex para implementación solo por capability code-write y nunca otorga workspace-write a Antigravity', () => {
-    expect(AGENT_REGISTRY.antigravity.capabilities).not.toContain('code-write');
+    expect(AGENT_REGISTRY.antigravity.allowedPermissions).not.toContain('workspace-write');
     expect(canAgentRun('antigravity', 'code-write', 'workspace-write')).toBe(false);
 
     const impl = routePhase({
