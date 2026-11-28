@@ -15,11 +15,25 @@ Codex se autentica fuera de OmniPilot mediante `codex login`. OmniPilot no solic
 - Proyectos fuente limitados a rutas relativas bajo `PROJECTS_ROOT`, resueltas con `realpath` y rechazadas si contienen escapes o symlinks incluidos. La copia omite `node_modules`, `.git`, `.env`, configuraciones de credenciales y extensiones comunes de claves.
 - Scripts de aceptación seleccionados exclusivamente por nombre entre las claves de `package.json.scripts`; la ejecución usa `npm run <nombre-validado>` con `shell: false`.
 - Parche de evidencia calculado con Git desde el commit baseline de la copia temporal. El proyecto fuente nunca se usa como directorio de ejecución.
-- Flujo Codex del orquestador implementado con pruebas falsas. La primera corrida end-to-end con Codex real sigue pendiente.
+- Registro de agentes (`server/src/orchestrator/router.js`, `AGENT_REGISTRY`):
+
+| Agente (`id`) | Capabilities | Permisos permitidos |
+| --- | --- | --- |
+| `codex` | `code-write`, `code-read`, `fix` | `workspace-write`, `read-only` |
+| `antigravity` | `plan`, `review`, `chat`, `code-write`, `fix` | `read-only`, `accept-edits` |
+| `local-verifier` | `verify` | `local-fixed-command` |
+
+- Regla de escritura (`canAgentRun`): tanto `accept-edits` como `workspace-write` exigen la capability `code-write`. Antigravity nunca tiene `workspace-write`.
+- Doble control en `runCodexFlow` (`server/src/orchestrator/orchestrator.js`): `antigravityUsable` decide el fallback consultando `canAgentRun` antes de `isAvailable()`, y `assertAgentPermitted` bloquea justo antes de cada llamada a `codex.run` o `antigravity.run`. Si el registro niega un fallback, `antigravityUsable` devuelve `false` sin emitir evento y el flujo sigue su camino alternativo (revisión → Codex `read-only`; implement/fix → sin fallback, falla con el error de Codex). Si una llamada llega a `assertAgentPermitted` y el registro la niega, se emite `step.failed` con `reason: "agent_not_permitted"` y el conector no se invoca.
+- Decisión explícita sobre Antigravity: puede editar (`--mode accept-edits --sandbox`) solo como fallback de implementación y `fix` cuando Codex falla. La revisión sigue en `--mode plan` (`read-only`).
 
 ## Límites
 
 La ruta de trabajo, el repositorio Git y el sandbox de Codex reducen el alcance de la ejecución, pero no equivalen a aislamiento fuerte del sistema operativo. El proceso conserva los permisos disponibles para su sandbox y entorno. No se añade `--skip-git-repo-check`.
+
+- `routePhase` todavía no recomienda Antigravity para implementación; el fallback de escritura lo decide el orquestador (`runCodexFlow`).
+- `AGENT_REGISTRY` es estático en código: no existe configuración por usuario ni por proyecto.
+- Corrida real posterior a `c113e88`: pendiente. La última corrida real (`fff3c9e4`, `2026-11-23`) es anterior a ese commit y solo usó Codex + `local-verifier`; no valida el registro ni el fallback a Antigravity.
 
 Los registros pueden contener objetivos o respuestas sensibles y deben mantenerse locales. La terminación de árboles está verificada en POSIX; la estrategia implementada para Windows sigue pendiente de validación en Windows.
 
