@@ -10,7 +10,7 @@ import { antigravityConnector } from '../connectors/antigravityConnector.js';
 import { resolveSafeWorkspacePath, initGitWorkspace, commitBaseline, captureGitPatch, getGitStatus } from '../security/workspaceGuard.js';
 import { redact } from '../security/runArtifacts.js';
 import { copyLocalProject, isExcludedProjectPath, captureAcceptanceManifest, verifyAcceptanceManifest } from '../projects/localProjects.js';
-import { createUsageState, recordProviderUsage, isBudgetExceeded } from '../metrics/usageTracker.js';
+import { createUsageState, applyUsageSnapshot, recordProviderUsage, isBudgetExceeded, isUsdBudgetExceeded, parseBudgetUsd } from '../metrics/usageTracker.js';
 import { normalizeActiveSkillIds, buildSkillRulesForRole, buildOddDelegation } from './oddSkills.js';
 import { buildAgentFailure } from './failureEvidence.js';
 
@@ -36,10 +36,15 @@ function normalizeRunSource(source) {
   };
 }
 
-export function createRun(goal, mode = 'demo', source = { type: 'template' }, budgets = {}, activeSkills = []) {
+export function createRun(goal, mode = 'demo', source = { type: 'template' }, budgets = {}, activeSkills = [], { budgetUsd } = {}) {
   if (typeof goal !== 'string' || !goal.trim() || goal.length > 1200) throw new Error('Objetivo inválido');
   if (!ALLOWED_MODES.has(mode)) throw new Error('Los conectores reales están bloqueados hasta validar docs/SPIKE.md');
   const normalizedSource = normalizeRunSource(source);
+  const resolvedBudgetUsd = budgetUsd !== undefined
+    ? parseBudgetUsd(budgetUsd)
+    : (budgets?.budgetUsd !== undefined
+      ? parseBudgetUsd(budgets.budgetUsd)
+      : (process.env.RUN_BUDGET_USD ? parseBudgetUsd(process.env.RUN_BUDGET_USD) : null));
   if (normalizedSource.type === 'local-project' && mode !== 'codex') throw new Error('local-project requiere mode codex');
   const id = randomUUID();
   const plan = createPlan(mode);
@@ -55,7 +60,7 @@ export function createRun(goal, mode = 'demo', source = { type: 'template' }, bu
     status: 'pending',
     source: normalizedSource,
     plan,
-    usage: createUsageState(budgets),
+    usage: createUsageState(budgets, { budgetUsd: resolvedBudgetUsd }),
     events: [],
     startedAt: null,
     completedAt: null,
@@ -239,6 +244,7 @@ export async function startRun(
     projectsRoot,
     enforceBudget = false,
     agentRegistry,
+    providerSettings,
   } = {},
 ) {
   if (run.status !== 'pending') throw new Error('Ejecución ya iniciada');
@@ -298,7 +304,7 @@ export async function startRun(
     if (run.mode === 'demo') {
       await runDemoFlow({ run, workspace, runner, logEvent, recordStep, recordDelegation, assertNotCancelled });
     } else {
-      await runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget, agentRegistry });
+      await runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget, agentRegistry, providerSettings });
     }
   } catch (error) {
     const cancelled = run.controller.signal.aborted && !executionTimedOut;
@@ -363,8 +369,42 @@ async function runDemoFlow({ run, workspace, runner, logEvent, recordStep, recor
   run.status = result.code === 0 ? 'completed' : 'failed';
 }
 
-async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget = false, agentRegistry }) {
+async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravityValidated, runner, logEvent, recordStep, recordDelegation, assertNotCancelled, assertWorkspaceSafe, enforceBudget = false, agentRegistry, providerSettings }) {
+  const settingsSnapshot = Object.freeze({
+    providers: Object.freeze({
+      codex: Object.freeze({
+        enabled: providerSettings?.providers?.codex?.enabled !== false,
+        usdPer1kTokens: Math.max(0, Number(providerSettings?.providers?.codex?.usdPer1kTokens ?? 0)),
+        tokenBudget: Number(providerSettings?.providers?.codex?.tokenBudget ?? run.usage.codex.budget),
+      }),
+      antigravity: Object.freeze({
+        enabled: providerSettings?.providers?.antigravity?.enabled !== false,
+        usdPer1kTokens: Math.max(0, Number(providerSettings?.providers?.antigravity?.usdPer1kTokens ?? 0)),
+        tokenBudget: Number(providerSettings?.providers?.antigravity?.tokenBudget ?? run.usage.antigravity.budget),
+      }),
+    }),
+    runBudgetUsd: providerSettings?.runBudgetUsd ?? null,
+  });
+  applyUsageSnapshot(run.usage, settingsSnapshot);
+
+  if (!settingsSnapshot.providers.codex.enabled) {
+    const message = 'Proveedor deshabilitado en configuración: codex';
+    await logEvent('step.failed', message, { step: 'implement', agent: 'codex-implement', reason: 'provider_disabled', agentId: 'codex' });
+    throw new Error(message);
+  }
+
   async function assertAgentPermitted(step, agentId, capability, permission) {
+    if (enforceBudget && isUsdBudgetExceeded(run.usage)) {
+      const message = `Presupuesto USD alcanzado ($${run.usage.costUsd.toFixed(4)} / $${run.usage.budgetUsd})`;
+      await logEvent('step.failed', message, {
+        step,
+        agent: `${agentId}-${step}`,
+        reason: 'budget_usd_exceeded',
+        costUsd: run.usage.costUsd,
+        budgetUsd: run.usage.budgetUsd,
+      });
+      throw new Error(message);
+    }
     if (canAgentRun(agentId, capability, permission, agentRegistry)) return;
     const message = `Agente no permitido: ${agentId} (${capability} / ${permission})`;
     await logEvent('step.failed', message, {
@@ -378,6 +418,7 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
     throw new Error(message);
   }
   async function antigravityUsable(capability, permission) {
+    if (!settingsSnapshot.providers.antigravity.enabled) return false;
     if (!antigravityValidated || !antigravity) return false;
     if (!canAgentRun('antigravity', capability, permission, agentRegistry)) return false;
     return Boolean((await antigravity.isAvailable({ signal: run.controller.signal })).available);
@@ -453,13 +494,16 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
   const beforeReview = await getGitStatus(workspace, { runner, signal: run.controller.signal });
   const reviewRules = buildSkillRulesForRole(run.memory.skills, 'review', { goal: run.goal });
   const reviewPrompt = buildPrompt('review', buildBoundedContext(run.memory, beforeReview.files), reviewRules);
+  const agyEnabled = settingsSnapshot.providers.antigravity.enabled;
   const agyReviewPermitted = canAgentRun('antigravity', 'review', 'read-only', agentRegistry);
   const useAntigravity = await antigravityUsable('review', 'read-only');
-  const reviewFallbackReason = !agyReviewPermitted
-    ? 'Antigravity denegado por registro de agentes; fallback a Codex en solo lectura.'
-    : (antigravityValidated
-      ? 'Antigravity no disponible; fallback a Codex en solo lectura.'
-      : 'Antigravity no validado; fallback a Codex en solo lectura.');
+  const reviewFallbackReason = !agyEnabled
+    ? 'Antigravity deshabilitado en configuración; fallback a Codex en solo lectura.'
+    : (!agyReviewPermitted
+      ? 'Antigravity denegado por registro de agentes; fallback a Codex en solo lectura.'
+      : (antigravityValidated
+        ? 'Antigravity no disponible; fallback a Codex en solo lectura.'
+        : 'Antigravity no validado; fallback a Codex en solo lectura.'));
   await recordDelegation('review', {
     provider: useAntigravity ? 'Antigravity' : 'Codex',
     agent: useAntigravity ? 'antigravity-review' : 'codex-review',
@@ -486,9 +530,11 @@ async function runCodexFlow({ run, dir, workspace, codex, antigravity, antigravi
       if (enforceBudget) throw new Error('Presupuesto local alcanzado para Codex; revisión detenida');
       await logEvent('usage.warning', 'Uso observado elevado para Codex (modo informativo); continuando con revisión');
     }
-    const reason = !agyReviewPermitted
-      ? 'Antigravity denegado por registro de agentes'
-      : (antigravityValidated ? 'Antigravity no disponible' : 'Antigravity no validado');
+    const reason = !agyEnabled
+      ? 'provider_disabled'
+      : (!agyReviewPermitted
+        ? 'Antigravity denegado por registro de agentes'
+        : (antigravityValidated ? 'Antigravity no disponible' : 'Antigravity no validado'));
     await logEvent('step.started', 'Iniciando revisión (Codex read-only)', { step: 'review', agent: reviewerAgent, fallback: true });
     await logEvent('log', `Fallback de revisión a Codex read-only: ${reason}`, { fallback: true, reason });
     await logEvent('review', 'Ejecutando revisión con Codex (read-only)');

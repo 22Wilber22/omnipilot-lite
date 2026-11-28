@@ -32,7 +32,8 @@ Codex se autentica fuera de OmniPilot mediante `codex login`. OmniPilot no solic
 La ruta de trabajo, el repositorio Git y el sandbox de Codex reducen el alcance de la ejecución, pero no equivalen a aislamiento fuerte del sistema operativo. El proceso conserva los permisos disponibles para su sandbox y entorno. No se añade `--skip-git-repo-check`.
 
 - `routePhase` todavía no recomienda Antigravity para implementación; el fallback de escritura lo decide el orquestador (`runCodexFlow`).
-- `AGENT_REGISTRY` es estático en código: no existe configuración por usuario ni por proyecto.
+- `AGENT_REGISTRY` es estático en código: no existe ninguna vía (archivo, variable de entorno o API) para ampliar capabilities o permisos desde configuración. `settings.json` solo admite `enabled`, `usdPer1kTokens`, `tokenBudget` y `runBudgetUsd` con validación Zod `.strict()`.
+- El costo en USD mostrado en UI y usado para `budget_usd_exceeded` es una estimación local calculada desde tokens reportados × tarifa configurada; si algún proveedor usado tiene tarifa `0`, se marca como `costUsdPartial: true` y no se corta por USD.
 - Corrida real posterior a `c113e88`: pendiente. La última corrida real (`fff3c9e4`, `2026-11-23`) es anterior a ese commit y solo usó Codex + `local-verifier`; no valida el registro ni el fallback a Antigravity.
 
 Los registros pueden contener objetivos o respuestas sensibles y deben mantenerse locales. La terminación de árboles está verificada en POSIX; la estrategia implementada para Windows sigue pendiente de validación en Windows.

@@ -232,15 +232,94 @@ export default function SettingsDrawer({
               </div>
               <div className="kv-row">
                 <label htmlFor="budget-codex">Presupuesto local · Codex</label>
-                <select id="budget-codex" value={budgets.codex} onChange={e => setBudgets(b => ({ ...b, codex: Number(e.target.value) }))}>
+                <select
+                  id="budget-codex"
+                  value={chatSettings?.providers?.codex?.tokenBudget ?? budgets.codex}
+                  onChange={e => {
+                    const tokenBudget = Number(e.target.value);
+                    setBudgets(b => ({ ...b, codex: tokenBudget }));
+                    onUpdateChatSettings({ providers: { codex: { tokenBudget } } });
+                  }}
+                  disabled={!diagnostics || busy}
+                >
                   {BUDGET_OPTIONS.map(n => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
                 </select>
               </div>
               <div className="kv-row">
+                <label htmlFor="enable-codex">Codex habilitado</label>
+                <input
+                  id="enable-codex"
+                  type="checkbox"
+                  checked={chatSettings?.providers?.codex?.enabled !== false}
+                  onChange={e => onUpdateChatSettings({ providers: { codex: { enabled: e.target.checked } } })}
+                  disabled={!diagnostics || busy}
+                />
+              </div>
+              <div className="kv-row">
+                <label htmlFor="rate-codex">Tarifa Codex (USD / 1k tokens)</label>
+                <input
+                  id="rate-codex"
+                  type="number"
+                  min="0"
+                  step="0.001"
+                  value={chatSettings?.providers?.codex?.usdPer1kTokens ?? 0}
+                  onChange={e => onUpdateChatSettings({ providers: { codex: { usdPer1kTokens: Math.max(0, Number(e.target.value) || 0) } } })}
+                  disabled={!diagnostics || busy}
+                />
+              </div>
+              <div className="kv-row">
                 <label htmlFor="budget-agy">Presupuesto local · Antigravity</label>
-                <select id="budget-agy" value={budgets.antigravity} onChange={e => setBudgets(b => ({ ...b, antigravity: Number(e.target.value) }))}>
+                <select
+                  id="budget-agy"
+                  value={chatSettings?.providers?.antigravity?.tokenBudget ?? budgets.antigravity}
+                  onChange={e => {
+                    const tokenBudget = Number(e.target.value);
+                    setBudgets(b => ({ ...b, antigravity: tokenBudget }));
+                    onUpdateChatSettings({ providers: { antigravity: { tokenBudget } } });
+                  }}
+                  disabled={!diagnostics || busy}
+                >
                   {BUDGET_OPTIONS.map(n => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
                 </select>
+              </div>
+              <div className="kv-row">
+                <label htmlFor="enable-agy">Antigravity habilitado</label>
+                <input
+                  id="enable-agy"
+                  type="checkbox"
+                  checked={chatSettings?.providers?.antigravity?.enabled !== false}
+                  onChange={e => onUpdateChatSettings({ providers: { antigravity: { enabled: e.target.checked } } })}
+                  disabled={!diagnostics || busy}
+                />
+              </div>
+              <div className="kv-row">
+                <label htmlFor="rate-agy">Tarifa Antigravity (USD / 1k tokens)</label>
+                <input
+                  id="rate-agy"
+                  type="number"
+                  min="0"
+                  step="0.001"
+                  value={chatSettings?.providers?.antigravity?.usdPer1kTokens ?? 0}
+                  onChange={e => onUpdateChatSettings({ providers: { antigravity: { usdPer1kTokens: Math.max(0, Number(e.target.value) || 0) } } })}
+                  disabled={!diagnostics || busy}
+                />
+              </div>
+              <div className="kv-row">
+                <label htmlFor="run-budget-usd">Tope por ejecución (USD, opcional)</label>
+                <input
+                  id="run-budget-usd"
+                  type="number"
+                  min="0.01"
+                  max="100"
+                  step="0.05"
+                  placeholder="Sin tope"
+                  value={chatSettings?.runBudgetUsd ?? ''}
+                  onChange={e => {
+                    const raw = e.target.value;
+                    onUpdateChatSettings({ runBudgetUsd: raw === '' ? null : Number(raw) });
+                  }}
+                  disabled={!diagnostics || busy}
+                />
               </div>
             </div>
             <p className="muted" style={{ marginTop: 8 }}>

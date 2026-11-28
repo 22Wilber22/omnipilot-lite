@@ -132,11 +132,7 @@ export function createApp({
 
   app.put('/api/settings', async (req, res) => {
     try {
-      const updated = await settingsStore.update({
-        ...(req.body?.chatProvider !== undefined ? { chatProvider: req.body.chatProvider } : {}),
-        ...(req.body?.chatModel !== undefined ? { chatModel: req.body.chatModel } : {}),
-        ...(req.body?.chatStyle !== undefined ? { chatStyle: req.body.chatStyle } : {}),
-      });
+      const updated = await settingsStore.update(req.body);
       res.json({ settings: updated });
     } catch (e) {
       res.status(400).json({ error: e.message });
@@ -613,7 +609,9 @@ export function createApp({
       } else {
         throw new Error('Tipo de source inválido');
       }
-      const run = createRun(req.body?.goal, req.body?.mode, source, req.body?.budgets, req.body?.activeSkills);
+      const run = createRun(req.body?.goal, req.body?.mode, source, req.body?.budgets, req.body?.activeSkills, {
+        budgetUsd: req.body?.budgetUsd,
+      });
       res.status(201).json(publicRun(run));
     } catch (e) {
       res.status(400).json({ error: e.message });
@@ -678,7 +676,8 @@ export function createApp({
     const convId = runToConversation.get(run.id);
     if (convId) await conversations.updateStatus(convId, 'running');
 
-    startRun(run, workspacesDir, { codex, antigravity, antigravityValidated, runner, projectsRoot, agentRegistry })
+    const providerSettings = await settingsStore.get();
+    startRun(run, workspacesDir, { codex, antigravity, antigravityValidated, runner, projectsRoot, agentRegistry, providerSettings })
       .catch(e => console.error('Run failure:', e.message))
       .finally(async () => {
         if (!convId) return;

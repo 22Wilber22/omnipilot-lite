@@ -54,6 +54,7 @@ export default function ActiveTeamPanel({
         </div>
         <p className="muted">Implementación y corrección</p>
         <UsageBar usage={runUsage?.codex} label="Presupuesto local Codex" />
+        <p className="muted mono-inline">Costo estimado: ${(runUsage?.codex?.costUsd ?? 0).toFixed(4)} USD</p>
       </article>
 
       <article className="team-card">
@@ -63,6 +64,7 @@ export default function ActiveTeamPanel({
         </div>
         <p className="muted">Planificación y revisión</p>
         <UsageBar usage={runUsage?.antigravity} label="Presupuesto local Antigravity" />
+        <p className="muted mono-inline">Costo estimado: ${(runUsage?.antigravity?.costUsd ?? 0).toFixed(4)} USD</p>
       </article>
 
       <article className="team-card">
@@ -72,6 +74,12 @@ export default function ActiveTeamPanel({
         </div>
         <p className="muted">Pruebas de aceptación fijas · 0 tokens</p>
       </article>
+
+      <div className="conv-chip mono-inline">
+        Total estimado: <strong>${(runUsage?.costUsd ?? 0).toFixed(4)} USD</strong>
+        {runUsage?.costUsdPartial ? ' (parcial)' : ''}
+        {runUsage?.budgetUsd ? <> / ${Number(runUsage.budgetUsd).toFixed(2)} tope</> : null}
+      </div>
 
       <p className="muted sidebar-note">El orquestador elige según el rol y disponibilidad.</p>
     </div>
